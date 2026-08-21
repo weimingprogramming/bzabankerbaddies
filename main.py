@@ -1,13 +1,15 @@
 import os
 import uvicorn
 from fastapi import FastAPI
+from problems import p1, p2, p3, p4
 
-app = FastAPI(title="Competition Service")
+app = FastAPI(title="Competition Service Engine")
 
-
-@app.get("/")
-def root():
-  return {"message": "Service is live"}
+# Mount routers for all 4 problem statements
+app.include_router(p1.router, prefix="/p1", tags=["Problem 1"])
+app.include_router(p2.router, prefix="/p2", tags=["Problem 2"])
+app.include_router(p3.router, prefix="/p3", tags=["Problem 3"])
+app.include_router(p4.router, prefix="/p4", tags=["Problem 4"])
 
 
 @app.get("/health")
