@@ -12,65 +12,85 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     pot = state.get("pot", 0)
     max_raise = state.get("max_raise_to")
     min_raise = state.get("min_raise_to")
+    call_amount = state.get("call_amount", 0)  # Amount needed to call
     
-    # Safety fallback
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
     is_pair = (comm_card is not None and my_card == comm_card)
-    has_monster_hand = False
+    
+    hand_tier = "trash"  # Categories: "monster", "medium", "trash"
 
     # ==========================================
-    # ULTRA-CONSERVATIVE NUTS DETERMINATION
+    # STRICT HAND TIER CLASSIFICATION
     # ==========================================
-    if comm_card is not None:
-        if rule == "obsidian":
-            # Leg 2: Smallest Wins (Pairs disabled). Monster = Card is 1
-            if my_card == 1:
-                has_monster_hand = True
+    if rule == "obsidian":
+        # Leg 2: Smallest Wins (Pairs mean nothing)
+        if my_card in [1, 2]:
+            hand_tier = "monster"
+        elif my_card in [3, 4, 5, 6]:
+            hand_tier = "medium"
+        else:
+            hand_tier = "trash"  # 7-13 are trash!
 
-        elif rule == "amaranth":
-            # Leg 3: Modular Math. Monster = Pair OR exact match distance
+    elif rule == "amaranth":
+        # Leg 3: Modular Match
+        if comm_card is None:
+            hand_tier = "medium" if my_card in [6, 7, 8] else "trash"
+        else:
             raw_score = (13 + comm_card - my_card) % 13
             if is_pair or raw_score == 0:
-                has_monster_hand = True
+                hand_tier = "monster"
+            elif raw_score in [11, 12]:
+                hand_tier = "medium"
+            else:
+                hand_tier = "trash"
 
+    else:
+        # Leg 1 & 4 (Verdigris / Cinnabar / Default): Largest Wins
+        if is_pair or my_card in [12, 13]:
+            hand_tier = "monster"
+        elif my_card in [8, 9, 10, 11]:
+            hand_tier = "medium"
         else:
-            # Leg 1 & Leg 4 (Verdigris / Cinnabar): Monster = Pair OR holding a 13
-            if is_pair or my_card == 13:
-                has_monster_hand = True
+            hand_tier = "trash"
 
-    # Helper for maximum raise
-    def get_max_bet():
-        if max_raise is not None:
-            return max_raise
-        if min_raise is not None:
-            return min_raise
-        return 0
+    # Safe value bet sizing (50% pot, never blind all-in)
+    def get_safe_raise_amount():
+        if max_raise is None or min_raise is None:
+            return 0
+        target = max(min_raise, int(pot * 0.5))
+        return min(target, max_raise)
 
     # ==========================================
-    # ACTION LOGIC (MAX AGGRESSION OR PASSIVE)
+    # CONSERVATIVE ACTION EXECUTION
     # ==========================================
     
-    # 1. MONSTER HAND: BLAST MAXIMUM RAISE
-    if has_monster_hand:
-        max_amt = get_max_bet()
-        if "raise" in legal_actions and max_amt > 0:
-            return {"action": "raise", "amount": max_amt}
-        if "bet" in legal_actions and max_amt > 0:
-            return {"action": "bet", "amount": max_amt}
+    # 1. MONSTER HAND: VALUE BET / RAISE
+    if hand_tier == "monster":
+        raise_amt = get_safe_raise_amount()
+        if "raise" in legal_actions and raise_amt > 0:
+            return {"action": "raise", "amount": raise_amt}
+        if "bet" in legal_actions and raise_amt > 0:
+            return {"action": "bet", "amount": raise_amt}
         if "call" in legal_actions:
             return {"action": "call"}
-            
-    # 2. STANDARD HAND: CHECK IF FREE, CALL IF CHEAP, NEVER RAISE
+        if "check" in legal_actions:
+            return {"action": "check"}
+
+    # 2. MEDIUM HAND: CHECK FOR FREE, CALL ONLY IF CHEAP (<= 2 CHIPS)
+    elif hand_tier == "medium":
+        if "check" in legal_actions:
+            return {"action": "check"}
+        if "call" in legal_actions and call_amount <= 2:
+            return {"action": "call"}
+        if "fold" in legal_actions:
+            return {"action": "fold"}
+
+    # 3. TRASH HAND: CHECK IF FREE, FOLD IMMEDIATELY IF BET TO
     if "check" in legal_actions:
         return {"action": "check"}
-        
-    if "call" in legal_actions:
-        # Only call if it's a reasonable chip amount relative to pot to avoid bleeding
-        return {"action": "call"}
-        
     if "fold" in legal_actions:
         return {"action": "fold"}
-        
+
     return {"action": "check" if "check" in legal_actions else "fold"}
