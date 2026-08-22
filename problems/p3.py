@@ -9,7 +9,7 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     my_card = state.get("your_number")
     comm_card = state.get("community_number")
     rule = state.get("table_rule", "unknown")
-    pot = state.get("pot", 0)
+    pot = state.get("pot", 1)  # Avoid division by zero
     max_raise = state.get("max_raise_to")
     min_raise = state.get("min_raise_to")
     call_amount = state.get("call_amount", 0)
@@ -17,86 +17,91 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
-    # Track active non-folded, non-busted opponents
-    players = state.get("players", [])
-    if isinstance(players, dict):
-        players = list(players.values())
-    active_opps = max(1, sum(1 for p in players if not p.get("folded", False) and not p.get("busted", False)) - 1)
-
     is_pair = (comm_card is not None and my_card == comm_card)
+    tier = "trash"  # Categories: "monster", "strong", "trash"
 
     # ==========================================
-    # 1. EVALUATE CARD STRENGTH (0.0 to 1.0)
+    # 1. HARD-CODED HAND TIER CLASSIFICATION
     # ==========================================
     if comm_card is None:
-        # Pre-reveal: Evaluate raw rank by rule
+        # Pre-reveal tight classification
         if rule == "obsidian":
-            strength = (14 - my_card) / 13.0
+            tier = "monster" if my_card in [1, 2] else ("strong" if my_card in [3, 4] else "trash")
         elif rule == "amaranth":
-            strength = 1.0 - (abs(my_card - 7) / 7.0)
+            tier = "strong" if my_card in [6, 7, 8] else "trash"
         else:
-            strength = my_card / 13.0
+            tier = "monster" if my_card == 13 else ("strong" if my_card in [11, 12] else "trash")
     else:
-        # Post-reveal: Evaluate true hand rank
+        # Post-reveal exact classification
         if rule == "obsidian":
-            # Lowest wins, pairs mean nothing
-            strength = (14 - my_card) / 13.0
+            # Smallest wins, pairs are worthless
+            if my_card in [1, 2]:
+                tier = "monster"
+            elif my_card in [3, 4]:
+                tier = "strong"
+            else:
+                tier = "trash"
+
         elif rule == "amaranth":
-            if is_pair:
-                strength = 1.0
+            # Modular match
+            score = (13 + comm_card - my_card) % 13
+            if is_pair or score == 0:
+                tier = "monster"
+            elif score in [11, 12]:
+                tier = "strong"
             else:
-                score = (13 + comm_card - my_card) % 13
-                strength = 1.0 if score == 0 else (score / 13.0)
+                tier = "trash"
+
         else:
-            # Standard High Card / Pairs win
-            if is_pair:
-                strength = 1.0
+            # Leg 1 / Leg 4: Largest wins
+            if is_pair or my_card == 13:
+                tier = "monster"
+            elif my_card in [11, 12]:
+                tier = "strong"
             else:
-                strength = my_card / 13.0
+                tier = "trash"
 
-    # Multiway probability adjustment
-    if strength < 1.0:
-        confidence = strength ** (active_opps * 0.7)
-    else:
-        confidence = 1.0
-
-    def get_balanced_bet(pct=0.4):
+    # Helper for disciplined bet sizing
+    def get_value_bet_amount(pct=0.4):
         if max_raise is None or min_raise is None:
             return 0
         desired = int(pot * pct)
         return max(min_raise, min(desired, max_raise))
 
     # ==========================================
-    # 2. DECISION ENGINE
+    # 2. DISCIPLINED ACTION LOGIC
     # ==========================================
 
-    # PREMIUM HAND (Confidence >= 0.75): Bet/Raise for value
-    if confidence >= 0.75:
-        bet_amt = get_balanced_bet(0.45)
+    # A. TIER 1: MONSTER HANDS -> VALUE BET / RAISE / CALL ANY
+    if tier == "monster":
+        bet_amt = get_value_bet_amount(0.5)
         if "raise" in legal_actions and bet_amt > 0:
             return {"action": "raise", "amount": bet_amt}
         if "bet" in legal_actions and bet_amt > 0:
             return {"action": "bet", "amount": bet_amt}
         if "call" in legal_actions:
             return {"action": "call"}
-
-    # MARGINAL HAND (Confidence >= 0.40): Opportunistic play / Pot control
-    elif confidence >= 0.40:
         if "check" in legal_actions:
-            # Late position pot steal pre-reveal if pot is small
-            if comm_card is None and active_opps <= 3 and "bet" in legal_actions:
-                steal_amt = get_balanced_bet(0.25)
-                if steal_amt > 0:
-                    return {"action": "bet", "amount": steal_amt}
             return {"action": "check"}
-        
-        # Only call small bets relative to strength
-        if "call" in legal_actions and call_amount <= 3:
-            return {"action": "call"}
 
-    # WEAK HAND: Free check or fold immediately
+    # B. TIER 2: STRONG HANDS -> CHECK FOR FREE, CALL ONLY ON GOOD ODDS
+    elif tier == "strong":
+        if "check" in legal_actions:
+            return {"action": "check"}
+            
+        # Pot odds filter: ONLY call if the call cost is <= 35% of the pot (3:1 odds)
+        # AND the raw call_amount is reasonably small (e.g., <= 5 chips)
+        if "call" in legal_actions:
+            if call_amount <= (pot * 0.35) and call_amount <= 5:
+                return {"action": "call"}
+            else:
+                # Opponent bet too big -> Fold marginal hands!
+                return {"action": "fold"}
+
+    # C. TIER 3: TRASH HANDS -> CHECK IF FREE, IMMEDIATELY FOLD TO BETS
     if "check" in legal_actions:
         return {"action": "check"}
+    
     if "fold" in legal_actions:
         return {"action": "fold"}
 
