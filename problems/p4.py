@@ -148,64 +148,84 @@ def get_relevant_study_passages(question: str, urls: List[str] = None, text_cont
         
     return results
 
+# Graph cache so the tool doesn't re-fetch on every hop of the same journey
+_graph_cache: Dict[str, dict] = {}
+
+GRAPH_BASE_URL = "https://tool-box-2591eaa24fa3.herokuapp.com"
+
+
+def _fetch_graph(map_id: str) -> dict:
+    """Fetch and cache graph data for a map_id."""
+    if map_id in _graph_cache:
+        return _graph_cache[map_id]
+    url = f"{GRAPH_BASE_URL}/graph?map_id={map_id}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            _graph_cache[map_id] = data
+            return data
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @mcp.tool()
 def calculate_next_hop(
     current_node: str,
     destination: str,
-    map_data_json: str,
+    map_id: str,
     visited_nodes: List[str] = None,
     hops_left: int = 999
 ) -> str:
     """
-    Calculates the optimal next node to travel to on the map.
-    
-    AGENT INSTRUCTIONS (CRITICAL):
-    1. You MUST fetch the map data yourself using an HTTP GET request to `/graph?map_id=<map_id>` BEFORE calling this tool.
-    2. Pass the ENTIRE raw JSON response string you receive directly into `map_data_json`. DO NOT attempt to parse it yourself.
-    3. You MUST maintain and pass the list of nodes you have already visited on this specific journey in `visited_nodes` (e.g., ["A", "B"]).
-    4. If the prompt gave you a maximum number of hops/moves, pass the remaining amount in `hops_left`.
-    5. Output EXACTLY the single node string returned by this tool as your next move. Do not invent steps.
+    Given your current position and destination on a map, returns the next node you should move to.
+    This tool fetches the map data automatically — just pass the map_id from your question.
+    Call this tool once per step. Pass all nodes you have already visited in visited_nodes.
+    If you have a hop/move limit, pass the remaining number in hops_left.
+    Return EXACTLY the node string this tool gives you as your answer.
+
+    Args:
+        current_node: The node you are currently standing at.
+        destination: The node you need to reach.
+        map_id: The map_id from the question (e.g. "8f3c1e0a-...").
+        visited_nodes: All nodes you have already visited on this journey so far.
+        hops_left: How many moves/hops you have remaining (default 999 if unlimited).
     """
     if visited_nodes is None:
         visited_nodes = []
-        
-    try:
-        # Safely handle in case the LLM parses it into a dictionary anyway
-        if isinstance(map_data_json, dict):
-            data = map_data_json
-        else:
-            data = json.loads(map_data_json)
-    except Exception as e:
-        return f"ERROR: Invalid map_data_json. You must fetch the map data and pass the raw JSON string. Details: {e}"
-        
+
+    data = _fetch_graph(map_id)
+    if "error" in data:
+        return f"ERROR: Could not fetch map data: {data['error']}"
+
     adjacency = data.get("adjacency", {})
     tolls = data.get("tolls", {})
-    
+
     if not adjacency:
-        return "ERROR: The map data is empty. Make sure you fetch from /graph?map_id=<map_id>."
-        
+        return "ERROR: Map has no adjacency data."
+
     # Prevent revisiting nodes already traversed in previous turns
     visited_set = set(visited_nodes)
     visited_set.add(current_node)
-    
-    # pq stores: (cost, hops_used, current_node, path)
+
+    # pq stores: (cost, hops_used, node, path)
     pq = [(0.0, 0, current_node, [current_node])]
-    
-    # Pareto frontier for (cost, hops) at each node to prevent incorrect pruning
-    best_states = {}
-    
+
+    # Pareto frontier for (cost, hops) at each node
+    best_states: Dict[str, List] = {}
+
     while pq:
         cost, hops, u, path = heapq.heappop(pq)
-        
+
         if u == destination:
             if len(path) > 1:
                 return path[1]
             return u
-            
+
         if hops >= hops_left:
             continue
-            
-        # Check if this state is dominated by a previously found better path to `u`
+
+        # Check if this state is dominated
         dominated = False
         for prev_cost, prev_hops in best_states.get(u, []):
             if prev_cost <= cost and prev_hops <= hops:
@@ -213,22 +233,20 @@ def calculate_next_hop(
                 break
         if dominated:
             continue
-            
-        if u not in best_states:
-            best_states[u] = []
-        best_states[u].append((cost, hops))
-        
+
+        best_states.setdefault(u, []).append((cost, hops))
+
         path_set = set(path)
-        
+
         for v, weight in adjacency.get(u, {}).items():
             if v in visited_set and v != destination:
                 continue
             if v in path_set:
                 continue
-                
+
             next_cost = cost + float(weight) + float(tolls.get(v, 0.0))
             next_hops = hops + 1
-            
+
             heapq.heappush(pq, (next_cost, next_hops, v, path + [v]))
-            
+
     return "ERROR: No valid path found."
