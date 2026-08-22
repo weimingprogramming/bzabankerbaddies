@@ -1,5 +1,6 @@
 import time
 import heapq
+import itertools
 from datetime import datetime, timezone
 from typing import Dict, Any
 from collections import defaultdict
@@ -19,7 +20,6 @@ def compute_traversal(base_dur: float, start_t: float, obs_list: list) -> float:
     if not obs_list:
         return start_t + base_dur
         
-    # RULE 1: Cannot wait at nodes. If the edge is blocked exactly at start_t, we cannot enter it.
     initial_speed = 1.0
     for st, et, sf in obs_list:
         if st <= start_t < et:
@@ -63,7 +63,6 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
     for case_id, case in batch.items():
         case_start = time.time()
         
-        # GLOBAL TIMEOUT: Preserve batch score if we are hitting the 10s ceiling
         if time.time() - global_start > 8.8:
             responses[case_id] = {"total_duration_sec": None, "arrival_time": None, "path": []}
             continue
@@ -114,17 +113,18 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
         static_visited = set()
         visited_states = set()
         
-        pq = [(start_time + static_dists[start_coord]/global_max_speed, start_time, start_coord, None)]
+        # CRITICAL FIX: The tie-breaker counter ensures heapq never compares the path_node tuples!
+        counter = itertools.count()
+        pq = [(start_time + static_dists[start_coord]/global_max_speed, start_time, next(counter), start_coord, None)]
         best_res = None
         
         while pq:
-            # PER-CASE TIMEOUT: Abort impossible cycles to save time for other cases
             if time.time() - case_start > 0.6:
                 break
             if time.time() - global_start > 8.8:
                 break
                 
-            est_total, curr_t, u, path_node = heapq.heappop(pq)
+            est_total, curr_t, _, u, path_node = heapq.heappop(pq)
             
             if u == end_coord:
                 best_res = (curr_t, path_node)
@@ -144,12 +144,10 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
                 
                 if t_next is not None and v in static_dists:
                     est_t = t_next + (static_dists[v] / global_max_speed)
-                    heapq.heappush(pq, (est_t, t_next, v, (eid, path_node)))
+                    heapq.heappush(pq, (est_t, t_next, next(counter), v, (eid, path_node)))
                     
         if best_res:
             arr_t, final_path_node = best_res
-            
-            # Sync float math to exact integers to match ISO formatting expectations
             arr_t = round(arr_t)
             
             path_res = []
