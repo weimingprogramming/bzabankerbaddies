@@ -2,7 +2,6 @@ from fastapi import APIRouter
 from typing import Dict, Any
 
 router = APIRouter()
-
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     legal_actions = state.get("legal_actions", [])
@@ -17,28 +16,27 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         return {"action": "fold" if "fold" in legal_actions else "check"}
 
     # ==========================================
-    # THE FINAL DECODER RING
+    # 1. PAIRS BEAT EVERYTHING
+    # The table rules only apply if NO ONE has a pair.
     # ==========================================
-    if rule in ["obsidian", "verdigris"]:
-        # LOWEST CARD WINS
-        # Inverts value: 1 = 1.0 (Monster), 13 = 0.07 (Trash)
-        strength = (14 - my_card) / 13.0
+    is_pair = (comm_card is not None and my_card == comm_card)
+    
+    if is_pair:
+        strength = 1.0
         
-    elif rule in ["cinnabar", "amaranth"]:
-        # HIGHEST CARD WINS
-        # Standard value: 13 = 1.0 (Monster), 1 = 0.07 (Trash)
-        # We also give Pairs a massive boost here just in case.
-        if comm_card is not None and my_card == comm_card:
-            strength = 1.0
-        else:
-            strength = my_card / 13.0
-            
     else:
-        # Fallback just in case
-        strength = my_card / 13.0
+        # ==========================================
+        # 2. IF NO PAIR, APPLY THE TABLE RULE
+        # ==========================================
+        if rule in ["obsidian", "verdigris"]:
+            # Lowest Card Wins
+            strength = (14 - my_card) / 13.0
+        else:
+            # cinnabar, amaranth, or fallback = Highest Card Wins
+            strength = my_card / 13.0
 
     # ==========================================
-    # POT CONTROL (Don't get stacked early!)
+    # POT CONTROL (Don't get stacked before the reveal!)
     # ==========================================
     if comm_card is None:
         strength = min(strength, 0.70)
@@ -51,8 +49,7 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     # AGGRESSIVE BETTING
     # ==========================================
     if strength >= 0.95:
-        legal_amount = get_legal_bet(pot * 2)  # Overbet the pot
-        
+        legal_amount = get_legal_bet(pot * 2)
         if "raise" in legal_actions: return {"action": "raise", "amount": legal_amount}
         elif "bet" in legal_actions: return {"action": "bet", "amount": legal_amount}
         elif "call" in legal_actions: return {"action": "call"}
