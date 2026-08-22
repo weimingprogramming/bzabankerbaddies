@@ -1,111 +1,41 @@
-from typing import Any, Dict, List, Optional
 from fastapi import APIRouter
-from pydantic import BaseModel, ConfigDict
+from typing import Dict, Any
 
 router = APIRouter()
 
+@router.post("/showdown")  # Adjust this endpoint to whatever P3 expects
+def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
+    # 1. Log the previous hand's showdown to deduce the secret rules
+    recent = state.get("recent_hands", [])
+    if recent:
+        last_hand = recent[-1]
+        # Only log if it went to a showdown (we need to see their cards)
+        if last_hand.get("showdown"):
+            rule = state.get("table_rule", "unknown")
+            leg = state.get("leg_number", "?")
+            
+            # Extract hands and winner
+            my_cards = last_hand["showdown"].get("your_cards", [])
+            opp_cards = last_hand["showdown"].get("opponent_cards", [])
+            chip_delta = last_hand.get("chip_delta", 0)
+            
+            winner = "TIE"
+            if chip_delta > 0: winner = "WE WON"
+            elif chip_delta < 0: winner = "OPPONENT WON"
+            
+            print(f"--- LEG {leg} | RULE: {rule} ---")
+            print(f"My Cards: {my_cards}")
+            print(f"Op Cards: {opp_cards}")
+            print(f"Result:   {winner}\n")
 
-class ShowdownPayload(BaseModel):
-  model_config = ConfigDict(extra="ignore")
-
-  round: str
-  your_number: int
-  community_number: Optional[int] = None
-  pot: int
-  to_call: int
-  min_raise_to: Optional[int] = None
-  max_raise_to: Optional[int] = None
-  legal_actions: List[str]
-  your_stack: int
-
-
-def calculate_move(data: ShowdownPayload) -> Dict[str, Any]:
-  legal = set(data.legal_actions)
-  is_post = data.round == "post_reveal"
-  to_call = data.to_call
-  pot = data.pot
-  your_num = data.your_number
-
-  # A pair is an automatic win unless the opponent has the exact same pair (a tie)
-  has_pair = is_post and (data.community_number is not None) and (your_num == data.community_number)
-
-  # --- Helper Actions ---
-  def do_raise(target_amt: int) -> Dict[str, Any]:
-    if data.min_raise_to is not None and data.max_raise_to is not None:
-      amt = max(data.min_raise_to, min(target_amt, data.max_raise_to))
-      if "raise" in legal:
-        return {"action": "raise", "amount": amt}
-      if "bet" in legal:
-        return {"action": "bet", "amount": amt}
-    return do_call()
-
-  def do_call() -> Dict[str, Any]:
-    if "call" in legal: return {"action": "call"}
-    if "check" in legal: return {"action": "check"}
-    return {"action": "fold"}
-
-  def do_check_fold() -> Dict[str, Any]:
-    if "check" in legal: return {"action": "check"}
-    if "fold" in legal: return {"action": "fold"}
-    return {"action": "call"}
-
-  # --- POST-REVEAL (COMMUNITY CARD IS OUT) ---
-  if is_post:
-    if has_pair:
-      # We have the nuts. Go all-in or max raise to extract everything.
-      return do_raise(data.max_raise_to or 200)
+    # 2. Force the showdown by always Checking or Calling
+    valid_actions = state.get("valid_actions", [])
     
-    if your_num == 13:
-      # Almost guaranteed win (only loses if Gaston randomly paired the board). 
-      if to_call == 0:
-        return do_raise(pot) # Bet the pot for value
-      return do_call()       # Just call to keep them bluffing
-      
-    if your_num >= 11:
-      # Very strong high card.
-      if to_call == 0:
-        return do_raise(max(data.min_raise_to or 4, int(pot * 0.5)))
-      if to_call <= 50:
-        return do_call()
-      return do_check_fold()
-      
-    if your_num >= 8:
-      # Bluff catchers. Do not fold to tiny bets anymore.
-      if to_call == 0:
+    if "check" in valid_actions:
         return {"action": "check"}
-      if to_call <= 15:
-        return do_call()
-      return do_check_fold()
-      
-    # Trash (1-7). Give up immediately if faced with a bet.
-    return do_check_fold()
+    elif "call" in valid_actions:
+        return {"action": "call"}
+    else:
+        # Fallback just in case
+        return {"action": valid_actions[0] if valid_actions else "fold"}
 
-  # --- PRE-REVEAL (NO COMMUNITY CARD YET) ---
-  else:
-    if your_num == 13:
-      # Raise big with the best card, just call if they shoved
-      if to_call <= 30:
-        return do_raise(max(data.min_raise_to or 6, 12))
-      return do_call()
-
-    if your_num >= 11:
-      # Value raise small bets, call medium bets
-      if to_call <= 5:
-        return do_raise(max(data.min_raise_to or 6, 10))
-      if to_call <= 15:
-        return do_call()
-      return do_check_fold()
-
-    if your_num >= 8:
-      # Keep Gaston honest by calling small pre-reveal raises
-      if to_call <= 8:
-        return do_call()
-      return do_check_fold()
-
-    # Trash (1-7). Fold immediately to avoid the slow bleed.
-    return do_check_fold()
-
-
-@router.post("/move")
-def handle_move(payload: ShowdownPayload):
-  return calculate_move(payload)
