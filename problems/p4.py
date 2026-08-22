@@ -373,23 +373,34 @@ def _discover_study_urls() -> List[str]:
     return found
 
 
+# Improved chunking with heading preservation and overlap
 def _load_study_materials() -> List[str]:
     global _study_chunks
     if _study_chunks:
         return _study_chunks
-    urls = _discover_study_urls()
-    texts = [t for t in _fetch_many(urls) if t]
-    chunks: List[str] = []
+    
+    texts = _fetch_many(STUDY_MATERIAL_URLS)
+    if any(not t for t in texts):  # Don't cache partial failures
+        return [t for t in texts if t]
+
+    chunks = []
     for text in texts:
-        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        if len(parts) < 2:
-            parts = [p.strip() for p in text.split("\n") if p.strip()]
-        for part in parts:
-            # merge short headings into the following paragraph
-            if chunks and re.match(r"^#{1,4}\s", chunks[-1]) and len(chunks[-1]) < 80:
-                chunks[-1] = chunks[-1] + "\n" + part
+        lines = text.split("\n")
+        current_header = ""
+        current_block = []
+        for line in lines:
+            if line.startswith("#"):
+                current_header = line.strip()
+            elif line.strip():
+                current_block.append(line.strip())
             else:
-                chunks.append(part)
+                if current_block:
+                    content = " ".join(current_block)
+                    chunks.append(f"{current_header}\n{content}".strip())
+                    current_block = []
+        if current_block:
+            chunks.append(f"{current_header}\n{' '.join(current_block)}".strip())
+            
     _study_chunks = chunks
     return chunks
 
@@ -694,29 +705,30 @@ def _friend_busy(day: str, friends: List[str]) -> List[tuple]:
 DAY_START, DAY_END = _time_to_min("08:00"), _time_to_min("23:00")
 
 
+# 1. Dynamic bounds in _meeting_window
 def _meeting_window(day: str, friends: List[str], duration: int, earliest: str, latest: str,
                      my_busy: Optional[List[str]], my_tentative: Optional[List[str]]) -> Optional[str]:
-    lo = max(_time_to_min(earliest), DAY_START)
-    hi = min(_time_to_min(latest), DAY_END)
-
+    lo = max(_time_to_min(earliest), 0)
+    hi = min(_time_to_min(latest), 1440)
+    
     friend_busy = _friend_busy(day, friends)
     mine_hard = _parse_intervals(my_busy)
     mine_tentative = _parse_intervals(my_tentative)
 
-    hard = friend_busy + mine_hard
-    with_tentative = hard + mine_tentative
-
-    clean = _free_windows(with_tentative, duration, lo, hi)
+    clean = _free_windows(friend_busy + mine_hard + mine_tentative, duration, lo, hi)
     if clean:
         s = clean[0][0]
         return f"{_min_to_time(s)}-{_min_to_time(s + duration)}"
 
-    fallback = _free_windows(hard, duration, lo, hi)
+    fallback = _free_windows(friend_busy + mine_hard, duration, lo, hi)
     if fallback:
         s = fallback[0][0]
         return f"{_min_to_time(s)}-{_min_to_time(s + duration)}"
 
     return None
+
+# 2. Deterministic sorting in plan_outing
+valid_venues = sorted(valid_venues, key=lambda v: v["name"])
 
 
 @mcp.tool()
