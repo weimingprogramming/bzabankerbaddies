@@ -5,9 +5,11 @@ from problems import p1, p2, p3, p4
 
 app = FastAPI(title="Competition Service Engine")
 
-app.include_router(p2.router, prefix="", tags=["Problem 2 Root"])
+# Mount root endpoints directly
+app.include_router(p2.router, prefix="", tags=["Problem 2 - Gateway"])
+app.include_router(p3.router, prefix="", tags=["Problem 3 - Showdown"])
 
-# Mount routers for all 4 problem statements
+# Mount problem sub-routes
 app.include_router(p1.router, prefix="/p1", tags=["Problem 1"])
 app.include_router(p2.router, prefix="/p2", tags=["Problem 2"])
 app.include_router(p3.router, prefix="/p3", tags=["Problem 3"])
