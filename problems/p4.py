@@ -2,6 +2,7 @@ import base64
 import numpy as np
 import cv2
 from fastmcp import FastMCP
+import re
 
 # Initialize the MCP Server
 mcp = FastMCP("NurseryServer")
@@ -11,20 +12,25 @@ def get_agent_name() -> str:
     """Returns the name of the agent."""
     return "Render-Baby"
 
+
 @mcp.tool()
-def calculate_math(a: int, b: int, operator: str) -> float:
+def calculate_math(expression: str) -> float:
     """
-    Performs basic arithmetic on numbers.
+    Evaluates a full mathematical expression string, automatically handling order of operations (PEMDAS).
     Args:
-        a: integer between -100 and 100
-        b: integer between -100 and 100
-        operator: One of '+', '-', '*', '/'
+        expression: The complete math problem (e.g., "2 + 3 * 5"). Do NOT break it into steps.
     """
-    if operator == "+": return float(a + b)
-    if operator == "-": return float(a - b)
-    if operator == "*": return float(a * b)
-    if operator == "/": return float(a / b) if b != 0 else 0.0
-    return 0.0
+    try:
+        # Clean up the string just in case it passes 'x' instead of '*'
+        expr = expression.replace("x", "*").replace("X", "*")
+        
+        # Strip out any non-math characters to safely evaluate
+        expr = re.sub(r'[^0-9\+\-\*\/\.\(\)\ ]', '', expr)
+        
+        # Python's eval() natively respects order of operations
+        return float(eval(expr))
+    except Exception:
+        return 0.0
 
 @mcp.tool()
 def identify_shape(image_b64: str) -> str:
