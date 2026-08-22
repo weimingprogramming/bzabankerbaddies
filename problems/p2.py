@@ -26,8 +26,9 @@ class SolveRequest(BaseModel):
 @router.post("/solve")
 def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
   try:
-    # Handle base64 padding issues if present
-    b64_str = request.payload.strip()
+    # Handle base64: strip whitespace/newlines, handle URL-safe encoding, fix padding
+    b64_str = request.payload.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+    b64_str = b64_str.replace('-', '+').replace('_', '/')
     missing_padding = len(b64_str) % 4
     if missing_padding:
       b64_str += "=" * (4 - missing_padding)
@@ -39,17 +40,17 @@ def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
         status_code=400, detail=f"Invalid base64 or JSON: {str(e)}"
     )
 
-  adapt_input = data.get("adaptInput", {})
-  user = adapt_input.get("user", {})
-  metadata = adapt_input.get("metadata", {})
+  adapt_input = data.get("adaptInput") or {}
+  user = adapt_input.get("user") or {}
+  metadata = adapt_input.get("metadata") or {}
 
-  # 1. Action mapping (convert to lowercase)
-  action = str(adapt_input.get("action", "")).lower()
+  # 1. Action mapping (convert to lowercase, strip whitespace)
+  action = str(adapt_input.get("action", "")).strip().lower()
 
   # 2. Priority mapping (string -> int or fallback to int)
   raw_priority = metadata.get("priority", 1)
   if isinstance(raw_priority, str):
-    priority = PRIORITY_MAP.get(raw_priority.upper(), 1)
+    priority = PRIORITY_MAP.get(raw_priority.strip().upper(), 1)
   elif isinstance(raw_priority, (int, float)):
     priority = int(raw_priority)
   else:
@@ -65,10 +66,10 @@ def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
   }
 
   # SLO computation from heartbeats
-  heartbeats: List[Dict] = data.get("heartbeats", [])
+  heartbeats: List[Dict] = data.get("heartbeats") or []
   slo_query = data.get("sloQuery")
 
-  if slo_query and heartbeats:
+  if slo_query is not None:
     target_service = slo_query.get("service", "")
     since = slo_query.get("since", 0)
 
@@ -77,12 +78,21 @@ def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
         if hb.get("service") == target_service and hb.get("timestamp", 0) >= since
     ]
 
-    if filtered:
-      ok_count = sum(1 for hb in filtered if hb.get("status") == "OK")
-      availability = ok_count / len(filtered)
+    if not filtered:
+      result["sloOutput"] = {
+          "availability": 0.0,
+          "p95LatencyMs": 0,
+      }
+    else:
+      ok_count = sum(
+          1 for hb in filtered
+          if str(hb.get("status", "")).strip().upper() == "OK"
+      )
+      availability = round(ok_count / len(filtered), 4)
 
       latencies = sorted(hb.get("latencyMs", 0) for hb in filtered)
-      idx = math.ceil(len(latencies) * 0.95) - 1
+      n = len(latencies)
+      idx = math.ceil(n * 0.95) - 1
       p95 = latencies[max(idx, 0)]
 
       result["sloOutput"] = {
