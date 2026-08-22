@@ -27,8 +27,11 @@ STUDY_MATERIAL_URLS = [
     f"{BASE_URL}/study-materials/5",
 ]
 
-_study_cache: List[str] = []       
-_graph_cache: Dict[str, dict] = {} 
+_study_cache: List[str] = []
+_graph_cache: Dict[str, dict] = {}
+_chunk_word_sets: List[set] = []
+_idf: Dict[str, float] = {}
+_tiktoken_enc = None
 
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", 
@@ -135,6 +138,37 @@ def _load_study_materials() -> List[str]:
     _study_cache = chunks
     return _study_cache
 
+def _precompute_index():
+    """Pre-compute IDF index and tiktoken encoder at startup."""
+    import math
+    global _chunk_word_sets, _idf, _tiktoken_enc
+
+    chunks = _load_study_materials()
+    if not chunks:
+        return
+
+    N = len(chunks)
+    _chunk_word_sets.clear()
+    for chunk in chunks:
+        words = set(re.findall(r'\b\w+\b', chunk.lower()))
+        _chunk_word_sets.append(words - STOPWORDS)
+
+    df: Dict[str, int] = {}
+    for ws in _chunk_word_sets:
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+
+    _idf.clear()
+    _idf.update({w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()})
+
+    try:
+        _tiktoken_enc = tiktoken.get_encoding("o200k_base")
+    except Exception:
+        _tiktoken_enc = tiktoken.get_encoding("cl100k_base")
+
+# Pre-load at import time so first retrieve call is instant
+_precompute_index()
+
 def _fetch_graph(map_id: str) -> dict:
     """Fetch and cache graph data for a map_id."""
     if map_id in _graph_cache:
@@ -155,55 +189,33 @@ def _fetch_graph(map_id: str) -> dict:
 
 def _retrieve_impl(text: str) -> List[str]:
     """Shared implementation for study material retrieval."""
-    import math
-
-    chunks = _load_study_materials()
+    chunks = _study_cache
     if not chunks:
         return ["Could not load study materials."]
 
-    N = len(chunks)
-
-    # Build per-chunk word sets for IDF calculation
-    chunk_word_sets = []
-    for chunk in chunks:
-        words = set(re.findall(r'\b\w+\b', chunk.lower()))
-        chunk_word_sets.append(words - STOPWORDS)
-
-    # Compute document frequency for each word
-    df = {}
-    for ws in chunk_word_sets:
-        for w in ws:
-            df[w] = df.get(w, 0) + 1
-
-    # IDF: log(N / df) — rarer words get higher weight
-    idf = {w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()}
+    enc = _tiktoken_enc
 
     # Extract query keywords
     raw_q_words = re.findall(r'\b\w+\b', text.lower())
     q_words = {w for w in raw_q_words if w not in STOPWORDS}
+    q_kw_list = [w for w in raw_q_words if w not in STOPWORDS]
+    q_bigrams = set(zip(q_kw_list, q_kw_list[1:]))
 
     # Score each chunk by sum of IDF weights for matching query words
     scored = []
     for i, chunk in enumerate(chunks):
-        matching = q_words & chunk_word_sets[i]
-        score = sum(idf.get(w, 0) for w in matching)
+        matching = q_words & _chunk_word_sets[i]
+        score = sum(_idf.get(w, 0) for w in matching)
 
         # Bonus for bigram matches (consecutive keyword pairs)
-        q_kw_list = [w for w in raw_q_words if w not in STOPWORDS]
         c_kw_list = [w for w in re.findall(r'\b\w+\b', chunk.lower()) if w not in STOPWORDS]
-        q_bigrams = set(zip(q_kw_list, q_kw_list[1:]))
         c_bigrams = set(zip(c_kw_list, c_kw_list[1:]))
         bigram_matches = q_bigrams & c_bigrams
-        score += sum(idf.get(a, 0) + idf.get(b, 0) for a, b in bigram_matches) * 2
+        score += sum(_idf.get(a, 0) + _idf.get(b, 0) for a, b in bigram_matches) * 2
 
         scored.append((score, chunk))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-
-    try:
-        enc = tiktoken.get_encoding("o200k_base")
-    except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
 
     results = []
     total_tokens = 0
