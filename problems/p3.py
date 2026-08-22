@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from typing import Dict, Any
 
 router = APIRouter()
+
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     legal_actions = state.get("legal_actions", [])
@@ -16,49 +17,46 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         return {"action": "fold" if "fold" in legal_actions else "check"}
 
     # ==========================================
-    # 1. PAIRS BEAT EVERYTHING
-    # The table rules only apply if NO ONE has a pair.
+    # 1. STRICT FACE-VALUE EVALUATION
+    # We no longer hardcode pairs as 1.0! If a rule disables pairs, 
+    # a pair of 2s is just a 2. We play the card's raw power.
     # ==========================================
-    is_pair = (comm_card is not None and my_card == comm_card)
-    
-    if is_pair:
-        strength = 1.0
-        
+    if rule in ["obsidian", "verdigris"]:
+        # Lowest Card Wins: 1 is a monster (1.0), 13 is trash
+        strength = (14 - my_card) / 13.0
     else:
-        # ==========================================
-        # 2. IF NO PAIR, APPLY THE TABLE RULE
-        # ==========================================
-        if rule in ["obsidian", "verdigris"]:
-            # Lowest Card Wins
-            strength = (14 - my_card) / 13.0
-        else:
-            # cinnabar, amaranth, or fallback = Highest Card Wins
-            strength = my_card / 13.0
+        # cinnabar, amaranth, or fallback: 13 is a monster (1.0), 1 is trash
+        strength = my_card / 13.0
 
     # ==========================================
-    # POT CONTROL (Don't get stacked before the reveal!)
+    # 2. STRICT POT CONTROL (Pre-reveal Cap)
+    # Never raise before the community card is revealed.
     # ==========================================
     if comm_card is None:
-        strength = min(strength, 0.70)
+        strength = min(strength, 0.60)
 
     def get_legal_bet(desired_amount):
         if max_raise is None or min_raise is None: return 0
         return max(min_raise, min(desired_amount, max_raise))
 
     # ==========================================
-    # AGGRESSIVE BETTING
+    # 3. SAFER AGGRESSION (Value Betting)
     # ==========================================
-    if strength >= 0.95:
-        legal_amount = get_legal_bet(pot * 2)
+    if strength >= 0.85:
+        # We have a top 2 card. Bet 75% of the pot to extract value safely.
+        legal_amount = get_legal_bet(int(pot * 0.75))
+        
         if "raise" in legal_actions: return {"action": "raise", "amount": legal_amount}
         elif "bet" in legal_actions: return {"action": "bet", "amount": legal_amount}
         elif "call" in legal_actions: return {"action": "call"}
         
-    elif strength >= 0.50:
+    elif strength >= 0.60:
+        # We have a decent card. See a cheap showdown.
         if "check" in legal_actions: return {"action": "check"}
         elif "call" in legal_actions: return {"action": "call"}
         
     else:
+        # We have trash. Fold immediately to a bet.
         if "check" in legal_actions: return {"action": "check"}
         elif "fold" in legal_actions: return {"action": "fold"}
         
