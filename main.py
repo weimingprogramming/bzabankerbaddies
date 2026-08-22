@@ -1,8 +1,8 @@
 import os
+
 import uvicorn
 from fastapi import FastAPI
 from problems import p1, p2, p3, p4
-
 app = FastAPI(title="Competition Service Engine")
 
 # Mount root endpoints directly
