@@ -16,10 +16,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Competition Service Engine", lifespan=lifespan)
 
-# 3. Mount the MCP server exactly at /mcp
-app.mount("/mcp", mcp_app)
-
-# Mount previous challenge endpoints
+# Mount root endpoints directly
+app.include_router(p1.router, prefix="", tags=["Problem 1 - Delivery Driver"])
 app.include_router(p2.router, prefix="", tags=["Problem 2 - Gateway"])
 app.include_router(p3.router, prefix="", tags=["Problem 3 - Showdown"])
 
