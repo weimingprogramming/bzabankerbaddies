@@ -436,6 +436,9 @@ def _fetch_inbox() -> list:
     data = _fetch_json(f"{BASE_URL}/inbox")
     if isinstance(data, list):
         _inbox_cache = data
+    elif isinstance(data, dict):
+        # API may wrap emails in {"emails": [...]}
+        _inbox_cache = data.get("emails", data.get("inbox", []))
     return _inbox_cache
 
 
@@ -586,7 +589,7 @@ def _parse_schedule_response(raw: str) -> list:
 
 
 @mcp.tool()
-def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: str = "00:00", latest: str = "23:59") -> str:
+def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: str = "08:00", latest: str = "23:00") -> str:
     """
     Find the earliest available meeting time for the android and a group of friends on a given day.
     Checks everyone's schedule and the android's inbox commitments to find a free window.
@@ -596,8 +599,8 @@ def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: s
         day: The day of the week (e.g., 'Monday').
         friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
         duration_minutes: Required meeting duration in minutes (e.g., 60).
-        earliest: Earliest allowed start time in HH:MM format (default '00:00').
-        latest: Latest allowed end time in HH:MM format (default '23:59').
+        earliest: Start of allowed time range in HH:MM 24-hour format. Always set this from the question (e.g., '18:00'). Defaults to '08:00'.
+        latest: End of allowed time range in HH:MM 24-hour format. Always set this from the question (e.g., '23:00'). Defaults to '23:00'.
     """
     friend_list = [f.strip() for f in friends.split(",") if f.strip()]
     range_start = _time_to_min(earliest)
@@ -715,10 +718,13 @@ def find_meeting_point(day: str, friends: str, my_x: int, my_y: int) -> str:
 
 
 @mcp.tool()
-def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: int) -> str:
+def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: int, earliest: str = "08:00", latest: str = "23:00") -> str:
     """
     Plan a complete outing: find meeting time, meeting point, and a suitable open venue.
     Use this when asked to plan an outing, get-together, or hangout with friends.
+
+    IMPORTANT: If the question specifies a time range (e.g., "between 18:00 and 23:00"),
+    you MUST pass the earliest and latest parameters to constrain the search.
 
     Args:
         day: The day of the week (e.g., 'Monday').
@@ -726,12 +732,53 @@ def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: 
         my_x: The android's x-coordinate (0-9).
         my_y: The android's y-coordinate (0-9).
         duration_minutes: Required meeting duration in minutes (e.g., 60).
+        earliest: Start of allowed time range in HH:MM format. MUST be set when the question specifies a range. Default '00:00'.
+        latest: End of allowed time range in HH:MM format. MUST be set when the question specifies a range. Default '23:59'.
     """
-    time_window = find_meeting_time(day, friends, duration_minutes)
+    time_window = find_meeting_time(day, friends, duration_minutes, earliest, latest)
     meeting_point = find_meeting_point(day, friends, my_x, my_y)
+
+    # Parse meeting point coordinates for venue distance calculation
+    mp_match = re.match(r'\[(\d+),(\d+)\]', meeting_point)
+    mp_x = int(mp_match.group(1)) if mp_match else my_x
+    mp_y = int(mp_match.group(2)) if mp_match else my_y
 
     # Find venues open at the start of the meeting window
     meet_start = time_window.split("-")[0] if "-" in time_window else "12:00"
-    venues_str = find_open_venues(day, meet_start)
 
-    return f"{time_window}, {meeting_point}, {venues_str}"
+    # Fetch venue data directly to pick the closest open venue
+    data = _fetch_json(f"{BASE_URL}/venues/{day}")
+    best_venue = None
+    best_dist = None
+    all_open = []
+
+    if data:
+        venues = data.get("venues", data) if isinstance(data, dict) else data
+        check = _time_to_min(meet_start)
+        for v in venues:
+            is_open = False
+            if "available" in v:
+                for window in v["available"]:
+                    o = _time_to_min(window[0])
+                    c = _time_to_min(window[1])
+                    if o <= check < c:
+                        is_open = True
+                        break
+            else:
+                o = _time_to_min(v.get("open", "00:00"))
+                c = _time_to_min(v.get("close", "00:00"))
+                if o <= check < c:
+                    is_open = True
+
+            if is_open:
+                all_open.append(v["name"])
+                vx = v.get("x", 0)
+                vy = v.get("y", 0)
+                dist = abs(vx - mp_x) + abs(vy - mp_y)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_venue = v["name"]
+
+    venue_result = best_venue if best_venue else "No venues are open at that time."
+
+    return f"{time_window}, {meeting_point}, {venue_result}"
