@@ -4,32 +4,29 @@ from typing import Dict, Any
 router = APIRouter()
 
 def calculate_hand_strength(my_card: int, comm_card: int, rule: str) -> float:
-    # 1. NO COMMUNITY CARD YET (Pre-reveal)
+    # 1. PRE-REVEAL EVALUATION (No Community Card Yet)
     if comm_card is None:
         if rule == "obsidian":
-            return (14 - my_card) / 13.0  # Lower is better
+            return (14 - my_card) / 13.0  # Lower card is better
         elif rule == "amaranth":
-            # Target middle cards (6-9) because high community cards are likely
-            return 1.0 - (abs(my_card - 7) / 7.0)
+            return 0.5                    # Neutral pre-reveal state
         else:
-            return my_card / 13.0  # Standard higher is better
+            return my_card / 13.0         # Standard higher card is better
 
     # 2. POST-REVEAL EVALUATION
     
-    # --- RULE: HIGHEST BELOW COMMUNITY CARD (Price is Right) ---
-    if rule == "amaranth":  # Or whichever rule code maps to this
-        if my_card <= comm_card:
-            # Valid hand: Scored between 0.50 and 1.0 based on how high it is
-            return 0.5 + (my_card / (2.0 * comm_card))
-        else:
-            # Busted hand (Over community card): Low score
-            return (my_card / 13.0) * 0.49
+    # --- LEG 3 (Amaranth): Wrap-Around Modular Math ---
+    if rule == "amaranth":
+        raw_score = (13 + comm_card - my_card) % 13
+        if raw_score == 0:
+            raw_score = 13
+        return raw_score / 13.0
 
-    # --- RULE: LOWEST CARD WINS ---
+    # --- LEG 2 (Obsidian): Lowest Card Wins ---
     elif rule == "obsidian":
         return (14 - my_card) / 13.0
 
-    # --- RULE: STANDARD HIGHEST CARD WINS ---
+    # --- LEG 1 & LEG 4 (Verdigris / Cinnabar / Fallback): Highest Card Wins ---
     else:
         return my_card / 13.0
 
@@ -47,10 +44,10 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
-    # Evaluate raw strength
+    # Evaluate raw strength based on table rule
     strength = calculate_hand_strength(my_card, comm_card, rule)
 
-    # Pairs check (if applicable)
+    # Pairs check (Active on all rules EXCEPT Obsidian)
     if comm_card is not None and my_card == comm_card and rule != "obsidian":
         strength = 1.0
 
@@ -60,6 +57,7 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         players = list(players.values())
     active_opps = max(1, sum(1 for p in players if not p.get("folded", False) and not p.get("busted", False)) - 1)
     
+    # Scale confidence down based on number of active opponents
     if strength < 1.0:
         confidence = strength ** (active_opps * 0.8)
     else:
@@ -80,7 +78,7 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         if "check" in legal_actions: return {"action": "check"}
         if "call" in legal_actions: return {"action": "call"}
 
-    # Weak hand: Check if free, fold if bet to
+    # Weak hand: Check if free, fold if forced to bet
     if "check" in legal_actions: return {"action": "check"}
     if "fold" in legal_actions: return {"action": "fold"}
 
