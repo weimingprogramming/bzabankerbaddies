@@ -16,37 +16,37 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
+    is_pair = (comm_card is not None and my_card == comm_card)
+
     # ==========================================
-    # 1. 100% CONFIDENCE FOR PAIRS
+    # 1. EVALUATE CONFIDENCE
     # ==========================================
-    if comm_card is not None and my_card == comm_card:
+    
+    # Pairs win 100% of the time EXCEPT in Obsidian!
+    if is_pair and rule != "obsidian":
         confidence = 1.0
         
-    else:
-        # ==========================================
-        # 2. THE TRUE RULE MAPPING
-        # ==========================================
-        if rule == "obsidian":
-            # Smallest wins: 1 is best (1.0), 13 is worst (0.0)
-            confidence = (14 - my_card) / 13.0
+    elif rule == "obsidian":
+        # Smallest wins: 1 is best, 13 is worst. Pairs mean NOTHING.
+        confidence = (14 - my_card) / 13.0
             
-        elif rule == "amaranth":
-            # Evens Win: Any Even beats any Odd. 
-            if my_card % 2 == 0:
-                confidence = 0.5 + (my_card / 26.0)  # Evens score 0.5 to 1.0
-            else:
-                confidence = my_card / 26.0          # Odds score 0.0 to 0.5
-                
-        elif rule == "cinnabar":
-            # Odds Win: Any Odd beats any Even.
-            if my_card % 2 != 0:
-                confidence = 0.5 + (my_card / 26.0)  # Odds score 0.5 to 1.0
-            else:
-                confidence = my_card / 26.0          # Evens score 0.0 to 0.5
-                
+    elif rule == "amaranth":
+        # Evens Win: Any Even beats any Odd. 
+        if my_card % 2 == 0:
+            confidence = 0.5 + (my_card / 26.0)
         else:
-            # verdigris: Largest wins (Standard)
-            confidence = my_card / 13.0
+            confidence = my_card / 26.0
+            
+    elif rule == "cinnabar":
+        # Odds Win: Any Odd beats any Even.
+        if my_card % 2 != 0:
+            confidence = 0.5 + (my_card / 26.0)
+        else:
+            confidence = my_card / 26.0
+            
+    else:
+        # verdigris: Largest wins (Standard)
+        confidence = my_card / 13.0
 
     # Pot Control: Never go crazy before the community card reveals
     if comm_card is None:
@@ -57,11 +57,11 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         return max(min_raise, min(desired_amount, max_raise))
 
     # ==========================================
-    # 3. SMART ACTION LOGIC
+    # 2. SMART ACTION LOGIC
     # ==========================================
     
     if confidence >= 0.85:
-        # Safe value bet (50% of pot) instead of wild overbetting
+        # Safe value bet (50% of pot)
         legal_amount = get_legal_bet(int(pot * 0.5))
         if "raise" in legal_actions: 
             return {"action": "raise", "amount": legal_amount}
