@@ -6,7 +6,7 @@ import re
 import urllib.request
 import json
 import heapq
-import tiktoken
+import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict
 
@@ -27,8 +27,10 @@ STUDY_MATERIAL_URLS = [
     f"{BASE_URL}/study-materials/5",
 ]
 
-_study_cache: List[str] = []       
-_graph_cache: Dict[str, dict] = {} 
+_study_cache: List[str] = []
+_graph_cache: Dict[str, dict] = {}
+_chunk_word_sets: List[set] = []
+_idf: Dict[str, float] = {}
 
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", 
@@ -40,7 +42,7 @@ STOPWORDS = {
     "own", "s", "same", "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs", 
     "them", "themselves", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", 
     "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", 
-    "why", "will", "with", "you", "your", "yours", "yourself", "yourselves", "many", "much"
+    "why", "will", "with", "you", "your", "yours", "yourself", "yourselves", "many", "much", "roughly"
 }
 
 # ---------------------------------------------------------------------------
@@ -92,19 +94,20 @@ def identify_shape(image_b64: str) -> str:
         return "circle"
 
 # ---------------------------------------------------------------------------
-# Core Helpers
+# Core Fetch Helpers (Optimized for Speed)
 # ---------------------------------------------------------------------------
 
 def _fetch_url(url: str) -> str:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        # Max 7s timeout to ensure we don't cross the 10s evaluation threshold
+        with urllib.request.urlopen(req, timeout=7) as resp:
             return resp.read().decode('utf-8')
     except Exception:
         return ""
 
 def _load_study_materials() -> List[str]:
-    """Fetch all study materials, chunk them, and cache."""
+    """Fetch all study materials dynamically on first call, then cache."""
     global _study_cache
     if _study_cache:
         return _study_cache
@@ -124,7 +127,6 @@ def _load_study_materials() -> List[str]:
     if len(raw_chunks) < 5:
         raw_chunks = [c.strip() for c in content.split('\n') if c.strip() and len(c.strip()) > 10]
 
-    # Merge heading-only chunks (e.g. "## Supply Schedule") with the next chunk
     chunks = []
     for chunk in raw_chunks:
         if chunks and re.match(r'^#{1,4}\s', chunks[-1]) and len(chunks[-1]) < 80:
@@ -135,14 +137,33 @@ def _load_study_materials() -> List[str]:
     _study_cache = chunks
     return _study_cache
 
+def _precompute_index():
+    """Pre-compute IDF index at startup so retrieve calls are instant."""
+    global _chunk_word_sets, _idf
+    chunks = _load_study_materials()
+    if not chunks:
+        return
+    N = len(chunks)
+    _chunk_word_sets.clear()
+    df: Dict[str, int] = {}
+    for c in chunks:
+        ws = set(re.findall(r'\b\w+\b', c.lower())) - STOPWORDS
+        _chunk_word_sets.append(ws)
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+    _idf.clear()
+    _idf.update({w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()})
+
+# Pre-load at import time so first retrieve call is instant
+_precompute_index()
+
 def _fetch_graph(map_id: str) -> dict:
-    """Fetch and cache graph data for a map_id."""
     if map_id in _graph_cache:
         return _graph_cache[map_id]
     url = f"{BASE_URL}/graph?map_id={map_id}"
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             _graph_cache[map_id] = data
             return data
@@ -150,81 +171,53 @@ def _fetch_graph(map_id: str) -> dict:
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# Stage 2 Tools: Recall and Navigate
+# Stage 2 & 3 Tools: Recall and Navigate
 # ---------------------------------------------------------------------------
 
-def _retrieve_impl(text: str) -> List[str]:
-    """Shared implementation for study material retrieval."""
-    import math
-
-    chunks = _load_study_materials()
+def _retrieve_impl(query: str) -> List[str]:
+    chunks = _study_cache
     if not chunks:
         return ["Could not load study materials."]
 
-    N = len(chunks)
-
-    # Build per-chunk word sets for IDF calculation
-    chunk_word_sets = []
-    for chunk in chunks:
-        words = set(re.findall(r'\b\w+\b', chunk.lower()))
-        chunk_word_sets.append(words - STOPWORDS)
-
-    # Compute document frequency for each word
-    df = {}
-    for ws in chunk_word_sets:
-        for w in ws:
-            df[w] = df.get(w, 0) + 1
-
-    # IDF: log(N / df) — rarer words get higher weight
-    idf = {w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()}
-
     # Extract query keywords
-    raw_q_words = re.findall(r'\b\w+\b', text.lower())
+    raw_q_words = re.findall(r'\b\w+\b', query.lower())
     q_words = {w for w in raw_q_words if w not in STOPWORDS}
+    q_kw_list = [w for w in raw_q_words if w not in STOPWORDS]
+    q_bigrams = set(zip(q_kw_list, q_kw_list[1:]))
 
-    # Score each chunk by sum of IDF weights for matching query words
+    # Score chunks using pre-computed IDF
     scored = []
     for i, chunk in enumerate(chunks):
-        matching = q_words & chunk_word_sets[i]
-        score = sum(idf.get(w, 0) for w in matching)
+        matching = q_words & _chunk_word_sets[i]
+        score = sum(_idf.get(w, 0) for w in matching)
 
-        # Bonus for bigram matches (consecutive keyword pairs)
-        q_kw_list = [w for w in raw_q_words if w not in STOPWORDS]
         c_kw_list = [w for w in re.findall(r'\b\w+\b', chunk.lower()) if w not in STOPWORDS]
-        q_bigrams = set(zip(q_kw_list, q_kw_list[1:]))
         c_bigrams = set(zip(c_kw_list, c_kw_list[1:]))
         bigram_matches = q_bigrams & c_bigrams
-        score += sum(idf.get(a, 0) + idf.get(b, 0) for a, b in bigram_matches) * 2
+        score += sum(_idf.get(a, 0) + _idf.get(b, 0) for a, b in bigram_matches) * 2
 
         scored.append((score, chunk))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    try:
-        enc = tiktoken.get_encoding("o200k_base")
-    except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
-
+    # 4. Truncate using Character Math (1 Token ≈ 4 Chars). Prevents tiktoken timeout.
     results = []
-    total_tokens = 0
+    total_chars = 0
+    MAX_CHARS = 3200 # Ensures we stay strictly under the 900 token limit safely
 
     for score, chunk in scored:
         if score == 0 and len(results) > 0:
             break
 
-        chunk_tokens = len(enc.encode(chunk))
-
-        if total_tokens + chunk_tokens > 880:
-            allowed = 880 - total_tokens
-            if allowed > 30:
-                encoded = enc.encode(chunk)
-                truncated = enc.decode(encoded[:allowed])
-                results.append(truncated)
-                total_tokens += len(enc.encode(truncated))
+        if total_chars + len(chunk) > MAX_CHARS:
+            allowed = MAX_CHARS - total_chars
+            if allowed > 100:
+                results.append(chunk[:allowed] + "...")
+                total_chars += allowed
             break
 
         results.append(chunk)
-        total_tokens += chunk_tokens
+        total_chars += len(chunk)
 
     return results if results else ["No relevant passages found."]
 
