@@ -120,9 +120,17 @@ def _load_study_materials() -> List[str]:
     if not content.strip():
         return []
 
-    chunks = [c.strip() for c in re.split(r'\n\s*\n', content) if c.strip()]
-    if len(chunks) < 5:
-        chunks = [c.strip() for c in content.split('\n') if c.strip() and len(c.strip()) > 10]
+    raw_chunks = [c.strip() for c in re.split(r'\n\s*\n', content) if c.strip()]
+    if len(raw_chunks) < 5:
+        raw_chunks = [c.strip() for c in content.split('\n') if c.strip() and len(c.strip()) > 10]
+
+    # Merge heading-only chunks (e.g. "## Supply Schedule") with the next chunk
+    chunks = []
+    for chunk in raw_chunks:
+        if chunks and re.match(r'^#{1,4}\s', chunks[-1]) and len(chunks[-1]) < 80:
+            chunks[-1] = chunks[-1] + "\n" + chunk
+        else:
+            chunks.append(chunk)
 
     _study_cache = chunks
     return _study_cache
@@ -271,60 +279,63 @@ def navigate(
         visited_nodes: Nodes already visited on this journey (to avoid revisiting).
         hops_remaining: Maximum number of moves remaining. If the question specifies a move limit, use it. Decrement by 1 each call.
     """
-    if visited_nodes is None:
-        visited_nodes = []
-    elif isinstance(visited_nodes, str):
-        visited_nodes = [x.strip() for x in visited_nodes.replace("[", "").replace("]", "").replace("'", "").replace('"', "").split(",") if x.strip()]
-
-    hops_left = 999
     try:
-        hops_left = int(hops_remaining)
-    except Exception:
-        pass
+        if visited_nodes is None:
+            visited_nodes = []
+        elif isinstance(visited_nodes, str):
+            visited_nodes = [x.strip() for x in visited_nodes.replace("[", "").replace("]", "").replace("'", "").replace('"', "").split(",") if x.strip()]
 
-    data = _fetch_graph(map_id)
-    if "error" in data:
-        return f"ERROR: Could not fetch map: {data['error']}"
+        hops_left = 999
+        try:
+            hops_left = int(hops_remaining)
+        except Exception:
+            pass
 
-    adjacency = data.get("adjacency", {})
-    tolls = data.get("tolls", {})
+        data = _fetch_graph(map_id)
+        if "error" in data:
+            return f"ERROR: Could not fetch map: {data['error']}"
 
-    if not adjacency:
-        return "ERROR: Map has no adjacency data."
+        adjacency = data.get("adjacency", {})
+        tolls = data.get("tolls", {})
 
-    visited_set = set(visited_nodes)
-    visited_set.add(current_node)
+        if not adjacency:
+            return "ERROR: Map has no adjacency data."
 
-    pq = [(0.0, 0, current_node, [current_node])]
-    best_states: Dict[str, List] = {}
+        visited_set = set(visited_nodes)
+        visited_set.add(current_node)
 
-    while pq:
-        cost, hops, u, path = heapq.heappop(pq)
+        pq = [(0.0, 0, current_node, [current_node])]
+        best_states: Dict[str, List] = {}
 
-        if u == destination:
-            return path[1] if len(path) > 1 else u
+        while pq:
+            cost, hops, u, path = heapq.heappop(pq)
 
-        if hops >= hops_left:
-            continue
+            if u == destination:
+                return path[1] if len(path) > 1 else u
 
-        dominated = False
-        for prev_cost, prev_hops in best_states.get(u, []):
-            if prev_cost <= cost and prev_hops <= hops:
-                dominated = True
-                break
-        if dominated:
-            continue
-
-        best_states.setdefault(u, []).append((cost, hops))
-        path_set = set(path)
-
-        for v, weight in adjacency.get(u, {}).items():
-            if v in visited_set and v != destination:
-                continue
-            if v in path_set:
+            if hops >= hops_left:
                 continue
 
-            next_cost = cost + float(weight) + float(tolls.get(v, 0.0))
-            heapq.heappush(pq, (next_cost, hops + 1, v, path + [v]))
+            dominated = False
+            for prev_cost, prev_hops in best_states.get(u, []):
+                if prev_cost <= cost and prev_hops <= hops:
+                    dominated = True
+                    break
+            if dominated:
+                continue
 
-    return "ERROR: No valid path found."
+            best_states.setdefault(u, []).append((cost, hops))
+            path_set = set(path)
+
+            for v, weight in adjacency.get(u, {}).items():
+                if v in visited_set and v != destination:
+                    continue
+                if v in path_set:
+                    continue
+
+                next_cost = cost + float(weight) + float(tolls.get(v, 0.0))
+                heapq.heappush(pq, (next_cost, hops + 1, v, path + [v]))
+
+        return "ERROR: No valid path found."
+    except Exception as e:
+        return f"ERROR: {str(e)}"
