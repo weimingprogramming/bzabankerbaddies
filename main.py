@@ -7,22 +7,24 @@ from problems import p1, p2, p3, p4
 # 1. Extract the ASGI app from the FastMCP instance
 mcp_app = p4.mcp.http_app(path="/")
 
-# 2. CRITICAL: Pass the FastMCP lifespan to FastAPI to prevent 500 errors
+# 2. CRITICAL BUGFIX: The organizers' code sets the lifespan on the WRONG app instance.
+# We must pass `mcp_app` into its own lifespan so it initializes its background tasks on its own state!
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with mcp_app.lifespan(app):
+    async with mcp_app.lifespan(mcp_app):
         yield
 
 app = FastAPI(title="Competition Service Engine", lifespan=lifespan)
 
-# 3. CRITICAL FIX: You must mount the MCP app so the /mcp endpoint exists!
+# 3. Mount the MCP app
 app.mount("/mcp", mcp_app)
 
-# Mount root endpoints directly
-app.include_router(p1.router, prefix="", tags=["Problem 1 - Delivery Driver"])
+# Mount root endpoints
+app.include_router(p1.router, prefix="", tags=["Problem 1 - Root"])
 app.include_router(p2.router, prefix="", tags=["Problem 2 - Gateway"])
 app.include_router(p3.router, prefix="", tags=["Problem 3 - Showdown"])
 
+# Standard prefixes
 app.include_router(p1.router, prefix="/p1", tags=["Problem 1"])
 app.include_router(p2.router, prefix="/p2", tags=["Problem 2"])
 app.include_router(p3.router, prefix="/p3", tags=["Problem 3"])
