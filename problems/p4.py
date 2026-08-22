@@ -188,12 +188,15 @@ def _retrieve_impl(query: str) -> List[str]:
       2. Bigram TF-IDF overlap        – rewards phrase-level matches
       3. Unigram TF-IDF overlap       – rewards individual keyword matches
       4. Fuzzy / stem-prefix matching  – catches morphological variants
-         (e.g. query "birthdate" matches chunk word "birthday")
+      5. Neighbor boost               – adjacent chunks inherit partial scores
+         so topically related passages (e.g. overview → leadership) stay together
     """
     _ensure_index()
     chunks = _study_cache
     if not chunks:
         return ["Could not load study materials."]
+
+    n_chunks = len(chunks)
 
     # ── query keywords ──────────────────────────────────────────────
     raw_q_words = re.findall(r'\b\w+\b', query.lower())
@@ -205,8 +208,22 @@ def _retrieve_impl(query: str) -> List[str]:
     # Stem-prefix set: first 4+ chars of each query word for fuzzy matching
     q_prefixes = {w[:max(4, len(w) * 2 // 3)] for w in q_words if len(w) >= 4}
 
+    # Semantic synonyms: map common query terms to related corpus terms
+    _synonyms = {
+        "leader": {"director", "commander", "chief", "head", "chair", "president", "lead"},
+        "leadership": {"director", "commander", "chief", "head", "chair", "president", "lead", "governance"},
+        "boss": {"director", "commander", "chief", "head", "chair", "president"},
+        "outpost": {"station", "facility", "habitat", "base", "post"},
+        "top": {"primary", "chief", "head", "lead", "senior", "first"},
+        "post": {"position", "role", "title", "office"},
+    }
+    expanded_words = set(q_words)
+    for qw in q_words:
+        if qw in _synonyms:
+            expanded_words |= _synonyms[qw]
+
     # ── score each chunk ────────────────────────────────────────────
-    scored = []
+    raw_scores = []
     for i, chunk in enumerate(chunks):
         score = 0.0
         chunk_lower = chunk.lower()
@@ -215,15 +232,14 @@ def _retrieve_impl(query: str) -> List[str]:
         if query_lower in chunk_lower:
             score += 20.0
         else:
-            # Check for long query n-grams (3+ keyword spans)
             for start in range(len(q_kw_list) - 2):
                 span = " ".join(q_kw_list[start:start + 3])
                 if span in chunk_lower:
                     score += 8.0
                     break
 
-        # Layer 2: unigram TF-IDF
-        matching = q_words & _chunk_word_sets[i]
+        # Layer 2: unigram TF-IDF (with synonym expansion)
+        matching = expanded_words & _chunk_word_sets[i]
         score += sum(_idf.get(w, 0) for w in matching)
 
         # Layer 3: bigram TF-IDF (phrase matches worth 2x)
@@ -242,8 +258,23 @@ def _retrieve_impl(query: str) -> List[str]:
                 if cw_prefix in q_prefixes:
                     score += _idf.get(cw, 1.0) * 0.5
 
-        scored.append((score, chunk))
+        raw_scores.append(score)
 
+    # ── Layer 5: neighbor boost ─────────────────────────────────────
+    # Chunks adjacent to high-scoring chunks get a fraction of their
+    # neighbor's score, so topically-related passages stick together.
+    boosted_scores = list(raw_scores)
+    NEIGHBOR_FRACTION = 0.35
+    for i in range(n_chunks):
+        if raw_scores[i] > 0:
+            if i > 0:
+                boosted_scores[i - 1] = max(boosted_scores[i - 1],
+                    raw_scores[i - 1] + raw_scores[i] * NEIGHBOR_FRACTION)
+            if i < n_chunks - 1:
+                boosted_scores[i + 1] = max(boosted_scores[i + 1],
+                    raw_scores[i + 1] + raw_scores[i] * NEIGHBOR_FRACTION)
+
+    scored = list(zip(boosted_scores, chunks))
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # ── assemble results under token budget ─────────────────────────
