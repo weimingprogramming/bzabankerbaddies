@@ -888,6 +888,7 @@ def plan_outing(
 
     check_start = _time_to_min(meet_end)
     check_end = check_start + 60
+
     valid_venues = []
     for v in venues or []:
         if not isinstance(v, dict):
@@ -898,10 +899,15 @@ def plan_outing(
                 if o <= check_start and check_end <= c:
                     valid_venues.append(v)
                     break
+
     if not valid_venues:
         return "No venues open for the hour after the meeting."
 
-    points = [(my_x, my_y)]
+    # PLACEMENT HERE (Inside plan_outing, after checking if not valid_venues):
+    valid_venues = sorted(valid_venues, key=lambda v: v["name"])
+
+    points = _locations(day, friend_list, my_x, my_y)
+    
     for f, u in location_urls.items():
         raw = text_by_url.get(u, "")
         if raw:
