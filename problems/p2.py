@@ -1,6 +1,7 @@
 import base64
 import json
-from typing import Any, Dict
+import math
+from typing import Any, Dict, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -54,7 +55,7 @@ def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
   else:
     priority = 1
 
-  return {
+  result: Dict[str, Any] = {
       "adaptOutput": {
           "id": user.get("id", ""),
           "name": user.get("fullName", ""),
@@ -62,3 +63,31 @@ def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
           "priority": priority,
       }
   }
+
+  # SLO computation from heartbeats
+  heartbeats: List[Dict] = data.get("heartbeats", [])
+  slo_query = data.get("sloQuery")
+
+  if slo_query and heartbeats:
+    target_service = slo_query.get("service", "")
+    since = slo_query.get("since", 0)
+
+    filtered = [
+        hb for hb in heartbeats
+        if hb.get("service") == target_service and hb.get("timestamp", 0) >= since
+    ]
+
+    if filtered:
+      ok_count = sum(1 for hb in filtered if hb.get("status") == "OK")
+      availability = ok_count / len(filtered)
+
+      latencies = sorted(hb.get("latencyMs", 0) for hb in filtered)
+      idx = math.ceil(len(latencies) * 0.95) - 1
+      p95 = latencies[max(idx, 0)]
+
+      result["sloOutput"] = {
+          "availability": availability,
+          "p95LatencyMs": p95,
+      }
+
+  return result
