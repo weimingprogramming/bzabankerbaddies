@@ -154,8 +154,14 @@ def _precompute_index():
     _idf.clear()
     _idf.update({w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()})
 
-# Pre-load at import time so first retrieve call is instant
-_precompute_index()
+# Lazy-load: defer to first retrieve call so server starts fast
+_index_ready = False
+
+def _ensure_index():
+    global _index_ready
+    if not _index_ready:
+        _precompute_index()
+        _index_ready = True
 
 def _fetch_graph(map_id: str) -> dict:
     if map_id in _graph_cache:
@@ -175,35 +181,75 @@ def _fetch_graph(map_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _retrieve_impl(query: str) -> List[str]:
+    """RAG retrieval: fetch the most relevant study-material chunks for a query.
+
+    Scoring layers (applied per chunk):
+      1. Exact substring match bonus  – the query appears verbatim in the chunk
+      2. Bigram TF-IDF overlap        – rewards phrase-level matches
+      3. Unigram TF-IDF overlap       – rewards individual keyword matches
+      4. Fuzzy / stem-prefix matching  – catches morphological variants
+         (e.g. query "birthdate" matches chunk word "birthday")
+    """
+    _ensure_index()
     chunks = _study_cache
     if not chunks:
         return ["Could not load study materials."]
 
-    # Extract query keywords
+    # ── query keywords ──────────────────────────────────────────────
     raw_q_words = re.findall(r'\b\w+\b', query.lower())
     q_words = {w for w in raw_q_words if w not in STOPWORDS}
     q_kw_list = [w for w in raw_q_words if w not in STOPWORDS]
     q_bigrams = set(zip(q_kw_list, q_kw_list[1:]))
+    query_lower = query.lower()
 
-    # Score chunks using pre-computed IDF
+    # Stem-prefix set: first 4+ chars of each query word for fuzzy matching
+    q_prefixes = {w[:max(4, len(w) * 2 // 3)] for w in q_words if len(w) >= 4}
+
+    # ── score each chunk ────────────────────────────────────────────
     scored = []
     for i, chunk in enumerate(chunks):
-        matching = q_words & _chunk_word_sets[i]
-        score = sum(_idf.get(w, 0) for w in matching)
+        score = 0.0
+        chunk_lower = chunk.lower()
 
-        c_kw_list = [w for w in re.findall(r'\b\w+\b', chunk.lower()) if w not in STOPWORDS]
+        # Layer 1: exact substring bonus (whole query or multi-word spans)
+        if query_lower in chunk_lower:
+            score += 20.0
+        else:
+            # Check for long query n-grams (3+ keyword spans)
+            for start in range(len(q_kw_list) - 2):
+                span = " ".join(q_kw_list[start:start + 3])
+                if span in chunk_lower:
+                    score += 8.0
+                    break
+
+        # Layer 2: unigram TF-IDF
+        matching = q_words & _chunk_word_sets[i]
+        score += sum(_idf.get(w, 0) for w in matching)
+
+        # Layer 3: bigram TF-IDF (phrase matches worth 2x)
+        c_kw_list = [w for w in re.findall(r'\b\w+\b', chunk_lower) if w not in STOPWORDS]
         c_bigrams = set(zip(c_kw_list, c_kw_list[1:]))
         bigram_matches = q_bigrams & c_bigrams
         score += sum(_idf.get(a, 0) + _idf.get(b, 0) for a, b in bigram_matches) * 2
+
+        # Layer 4: fuzzy stem-prefix matching for words not already matched
+        unmatched = q_words - matching
+        if unmatched and q_prefixes:
+            for cw in _chunk_word_sets[i]:
+                if len(cw) < 4:
+                    continue
+                cw_prefix = cw[:max(4, len(cw) * 2 // 3)]
+                if cw_prefix in q_prefixes:
+                    score += _idf.get(cw, 1.0) * 0.5
 
         scored.append((score, chunk))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # 4. Truncate using Character Math (1 Token ≈ 4 Chars). Prevents tiktoken timeout.
+    # ── assemble results under token budget ─────────────────────────
     results = []
     total_chars = 0
-    MAX_CHARS = 3200 # Ensures we stay strictly under the 900 token limit safely
+    MAX_CHARS = 4000  # ~1000 tokens budget for retrieved context
 
     for score, chunk in scored:
         if score == 0 and len(results) > 0:
