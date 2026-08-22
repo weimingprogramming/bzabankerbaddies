@@ -35,6 +35,8 @@ import json
 import math
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
@@ -47,8 +49,6 @@ from fastmcp import FastMCP
 mcp = FastMCP("ToolBoxServer")
 
 BASE_URL = "https://tool-box-2591eaa24fa3.herokuapp.com"
-
-STUDY_MATERIAL_URLS = [f"{BASE_URL}/study-materials/{i}" for i in range(1, 6)]
 
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at",
@@ -74,17 +74,41 @@ def _count_tokens(text: str) -> int:
     return len(_ENC.encode(text))
 
 
-def _fetch_url(url: str, timeout: float = 6.0) -> str:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
-    except Exception:
-        return ""
+_url_cache: Dict[str, str] = {}
 
 
-def _fetch_json(url: str, timeout: float = 6.0):
-    raw = _fetch_url(url, timeout=timeout)
+def _fetch_url(url: str, timeout: float = 4.0, retries: int = 1, backoff: float = 0.3,
+                use_cache: bool = True) -> str:
+    """
+    Fetch a URL with a couple of retries. Successful (non-empty) responses are cached
+    by URL for the life of the process -- cheap, and it means a transient failure on
+    one call doesn't have to be paid for again by every later call that needs the same
+    data (friend schedules, locations, the graph, etc. are stable within a run).
+
+    A 404/other real HTTP error returns immediately (no point retrying that), so
+    probing for endpoints that may or may not exist stays fast.
+    """
+    if use_cache and url in _url_cache:
+        return _url_cache[url]
+
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8")
+                if use_cache and text:
+                    _url_cache[url] = text
+                return text
+        except urllib.error.HTTPError:
+            return ""  # real 4xx/5xx -- retrying won't help, and we don't want to stall on it
+        except Exception:
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    return ""
+
+
+def _fetch_json(url: str, timeout: float = 4.0, retries: int = 1):
+    raw = _fetch_url(url, timeout=timeout, retries=retries)
     if not raw:
         return None
     try:
@@ -93,11 +117,11 @@ def _fetch_json(url: str, timeout: float = 6.0):
         return None
 
 
-def _fetch_many(urls: List[str], timeout: float = 6.0) -> List[str]:
+def _fetch_many(urls: List[str], timeout: float = 4.0, retries: int = 1) -> List[str]:
     if not urls:
         return []
     with ThreadPoolExecutor(max_workers=len(urls)) as pool:
-        return list(pool.map(lambda u: _fetch_url(u, timeout), urls))
+        return list(pool.map(lambda u: _fetch_url(u, timeout, retries), urls))
 
 
 def _time_to_min(t: str) -> int:
@@ -288,44 +312,133 @@ def identify_shape(image_base64: str) -> str:
 
 _study_chunks: List[str] = []
 _chunk_word_sets: List[set] = []
+_chunk_stem_sets: List[set] = []
 _idf: Dict[str, float] = {}
+_stem_idf: Dict[str, float] = {}
 _index_ready = False
 
 
+def _extract_urls_from_index(data) -> List[str]:
+    """Pull a list of document URLs out of whatever shape an index endpoint returns."""
+    candidates = None
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("documents", "materials", "study_materials", "urls", "items", "pages", "links"):
+            if isinstance(data.get(key), list):
+                candidates = data[key]
+                break
+    if not candidates:
+        return []
+
+    urls = []
+    for c in candidates:
+        if isinstance(c, str):
+            path = c
+        elif isinstance(c, dict):
+            path = next((c[k] for k in ("url", "address", "href", "path") if c.get(k)), None)
+        else:
+            path = None
+        if not path:
+            continue
+        urls.append(path if path.startswith("http") else f"{BASE_URL}{path if path.startswith('/') else '/' + path}")
+    return urls
+
+
+def _discover_study_urls() -> List[str]:
+    """
+    Don't assume a fixed document count. Try a couple of plausible index endpoints
+    first; if none exist, probe numbered documents in parallel batches until a whole
+    batch comes back empty. This is the fix for silently missing documents beyond
+    whatever count was true the day this code was written.
+    """
+    for index_path in ("/study-materials", "/study-materials/index"):
+        data = _fetch_json(f"{BASE_URL}{index_path}", timeout=3.0, retries=0)
+        urls = _extract_urls_from_index(data) if data else []
+        if urls:
+            return urls
+
+    found: List[str] = []
+    batch_size = 10
+    max_docs = 30
+    start = 1
+    while start <= max_docs:
+        batch = [f"{BASE_URL}/study-materials/{i}" for i in range(start, min(start + batch_size, max_docs + 1))]
+        texts = _fetch_many(batch, timeout=3.0, retries=0)
+        hits = [url for url, text in zip(batch, texts) if text.strip()]
+        if not hits:
+            break
+        found.extend(hits)
+        start += batch_size
+    return found
+
+
+# Improved chunking with heading preservation and overlap
 def _load_study_materials() -> List[str]:
     global _study_chunks
     if _study_chunks:
         return _study_chunks
-    texts = [t for t in _fetch_many(STUDY_MATERIAL_URLS) if t]
-    chunks: List[str] = []
+    
+    texts = _fetch_many(STUDY_MATERIAL_URLS)
+    if any(not t for t in texts):  # Don't cache partial failures
+        return [t for t in texts if t]
+
+    chunks = []
     for text in texts:
-        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        if len(parts) < 2:
-            parts = [p.strip() for p in text.split("\n") if p.strip()]
-        for part in parts:
-            # merge short headings into the following paragraph
-            if chunks and re.match(r"^#{1,4}\s", chunks[-1]) and len(chunks[-1]) < 80:
-                chunks[-1] = chunks[-1] + "\n" + part
+        lines = text.split("\n")
+        current_header = ""
+        current_block = []
+        for line in lines:
+            if line.startswith("#"):
+                current_header = line.strip()
+            elif line.strip():
+                current_block.append(line.strip())
             else:
-                chunks.append(part)
+                if current_block:
+                    content = " ".join(current_block)
+                    chunks.append(f"{current_header}\n{content}".strip())
+                    current_block = []
+        if current_block:
+            chunks.append(f"{current_header}\n{' '.join(current_block)}".strip())
+            
     _study_chunks = chunks
     return chunks
 
 
+_STEM_SUFFIXES = ("ations", "ation", "ments", "ment", "ities", "ity", "ing", "ies", "ied", "es", "ed", "s")
+
+
+def _stem(word: str) -> str:
+    """Cheap suffix-stripping so 'resolved'/'resolve'/'resolution'-ish variants can
+    still match without needing real morphology. Deliberately conservative (keeps at
+    least a 3-char stem) so it doesn't collapse unrelated short words together."""
+    for suf in _STEM_SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            return word[: -len(suf)]
+    return word
+
+
 def _ensure_index():
-    global _index_ready, _idf, _chunk_word_sets
+    global _index_ready, _idf, _stem_idf, _chunk_word_sets, _chunk_stem_sets
     if _index_ready:
         return
     chunks = _load_study_materials()
     _chunk_word_sets = []
+    _chunk_stem_sets = []
     df: Dict[str, int] = {}
+    stem_df: Dict[str, int] = {}
     for c in chunks:
         words = set(re.findall(r"\b\w+\b", c.lower())) - STOPWORDS
+        stems = {_stem(w) for w in words}
         _chunk_word_sets.append(words)
+        _chunk_stem_sets.append(stems)
         for w in words:
             df[w] = df.get(w, 0) + 1
+        for s in stems:
+            stem_df[s] = stem_df.get(s, 0) + 1
     n = max(len(chunks), 1)
     _idf = {w: math.log((n + 1) / (f + 1)) + 1.0 for w, f in df.items()}
+    _stem_idf = {s: math.log((n + 1) / (f + 1)) + 1.0 for s, f in stem_df.items()}
     _index_ready = True
 
 
@@ -337,6 +450,7 @@ def _score_chunks(query: str):
 
     q_words_raw = re.findall(r"\b\w+\b", query.lower())
     q_words = {w for w in q_words_raw if w not in STOPWORDS}
+    q_stems = {_stem(w) for w in q_words}
     q_kw = [w for w in q_words_raw if w not in STOPWORDS]
     q_bigrams = set(zip(q_kw, q_kw[1:]))
     q_lower = query.lower()
@@ -354,6 +468,10 @@ def _score_chunks(query: str):
                     break
         matched = q_words & _chunk_word_sets[i]
         score += sum(_idf.get(w, 0.0) for w in matched)
+        # stem-level match catches simple word-form variants (resolve/resolved/resolution)
+        # that exact-word overlap misses; weighted lower since it's a weaker signal.
+        stem_matched = q_stems & _chunk_stem_sets[i]
+        score += sum(_stem_idf.get(s, 0.0) for s in stem_matched) * 0.6
         c_kw = [w for w in re.findall(r"\b\w+\b", c_lower) if w not in STOPWORDS]
         c_bigrams = set(zip(c_kw, c_kw[1:]))
         for a, b in q_bigrams & c_bigrams:
@@ -393,22 +511,26 @@ def recall_study_material(question: str) -> List[str]:
     if not scored:
         return ["Could not load study materials."]
 
+    # Deliberately do NOT stop early on a zero-scored chunk. The scoring is lexical
+    # (TF-IDF + light stemming), and a chunk that answers a paraphrased question can
+    # easily score 0 while still being the one passage with the actual fact. As long
+    # as there's budget left, keep packing lower-ranked chunks too -- more coverage
+    # only helps, it never hurts, since the android just reads what's relevant.
     result: List[str] = []
     used = 0
     for score, chunk in scored:
-        if score <= 0 and result:
+        remaining = RECALL_TOKEN_BUDGET - used
+        if remaining <= 5:
             break
         tok = _count_tokens(chunk)
-        if used + tok <= RECALL_TOKEN_BUDGET:
+        if tok <= remaining:
             result.append(chunk)
             used += tok
-            continue
-        remaining = RECALL_TOKEN_BUDGET - used
-        if remaining > 20:
+        else:
             ids = _ENC.encode(chunk)[:remaining]
             result.append(_ENC.decode(ids))
             used += remaining
-        break
+            break
 
     if not result:
         ids = _ENC.encode(scored[0][1])[:RECALL_TOKEN_BUDGET]
@@ -541,48 +663,72 @@ def list_open_venues(day: str, time: str) -> str:
     return ", ".join(open_names) if open_names else "No venues are open at that time."
 
 
+def _busy_block_to_interval(block):
+    """Accept the documented [start, end] list shape, and defensively also a
+    {"start": .., "end": ..} dict shape in case a server ever varies from spec."""
+    try:
+        if isinstance(block, list) and len(block) == 2:
+            return (_time_to_min(block[0]), _time_to_min(block[1]))
+        if isinstance(block, dict) and "start" in block and "end" in block:
+            return (_time_to_min(block["start"]), _time_to_min(block["end"]))
+    except Exception:
+        pass
+    return None
+
+
+def _parse_schedule_text(raw: str) -> List[tuple]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    out = []
+    for block in data.get("busy", []):
+        iv = _busy_block_to_interval(block)
+        if iv:
+            out.append(iv)
+    return out
+
+
 def _friend_busy(day: str, friends: List[str]) -> List[tuple]:
-    raws = _fetch_many([f"{BASE_URL}/schedule/{f}/{day}" for f in friends])
+    # A couple of retries with a real timeout -- a friend's schedule fetch failing
+    # silently used to mean "treat them as free all day", which is the worst possible
+    # default: it produces a confidently wrong answer instead of a visibly missing one.
+    raws = _fetch_many([f"{BASE_URL}/schedule/{f}/{day}" for f in friends], timeout=5.0, retries=2)
     busy = []
     for raw in raws:
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for block in data.get("busy", []):
-            if isinstance(block, list) and len(block) == 2:
-                busy.append((_time_to_min(block[0]), _time_to_min(block[1])))
+        busy.extend(_parse_schedule_text(raw))
     return busy
 
 
 DAY_START, DAY_END = _time_to_min("08:00"), _time_to_min("23:00")
 
 
+# 1. Dynamic bounds in _meeting_window
 def _meeting_window(day: str, friends: List[str], duration: int, earliest: str, latest: str,
                      my_busy: Optional[List[str]], my_tentative: Optional[List[str]]) -> Optional[str]:
-    lo = max(_time_to_min(earliest), DAY_START)
-    hi = min(_time_to_min(latest), DAY_END)
-
+    lo = max(_time_to_min(earliest), 0)
+    hi = min(_time_to_min(latest), 1440)
+    
     friend_busy = _friend_busy(day, friends)
     mine_hard = _parse_intervals(my_busy)
     mine_tentative = _parse_intervals(my_tentative)
 
-    hard = friend_busy + mine_hard
-    with_tentative = hard + mine_tentative
-
-    clean = _free_windows(with_tentative, duration, lo, hi)
+    clean = _free_windows(friend_busy + mine_hard + mine_tentative, duration, lo, hi)
     if clean:
         s = clean[0][0]
         return f"{_min_to_time(s)}-{_min_to_time(s + duration)}"
 
-    fallback = _free_windows(hard, duration, lo, hi)
+    fallback = _free_windows(friend_busy + mine_hard, duration, lo, hi)
     if fallback:
         s = fallback[0][0]
         return f"{_min_to_time(s)}-{_min_to_time(s + duration)}"
 
     return None
+
+# 2. Deterministic sorting in plan_outing
+valid_venues = sorted(valid_venues, key=lambda v: v["name"])
 
 
 @mcp.tool()
@@ -695,12 +841,45 @@ def plan_outing(
     """
     friend_list = [f.strip() for f in friends.split(",") if f.strip()]
 
-    window = _meeting_window(day, friend_list, int(duration_minutes), earliest, latest, my_busy, my_tentative)
+    # Fetch everything (friend schedules, friend locations, venues) in ONE parallel
+    # round instead of three sequential phases. Three sequential phases, each with
+    # its own timeout, can stack past the 10s per-response limit if any one of them
+    # is slow -- which reads exactly like a tool call that "never gets going".
+    schedule_urls = {f: f"{BASE_URL}/schedule/{f}/{day}" for f in friend_list}
+    location_urls = {f: f"{BASE_URL}/location/{f}/{day}" for f in friend_list}
+    venues_url = f"{BASE_URL}/venues/{day}"
+
+    all_urls = list(schedule_urls.values()) + list(location_urls.values()) + [venues_url]
+    all_texts = _fetch_many(all_urls, timeout=4.0, retries=1)
+    text_by_url = dict(zip(all_urls, all_texts))
+
+    friend_busy = []
+    for f, u in schedule_urls.items():
+        friend_busy.extend(_parse_schedule_text(text_by_url.get(u, "")))
+
+    mine_hard = _parse_intervals(my_busy)
+    mine_tentative = _parse_intervals(my_tentative)
+    lo = max(_time_to_min(earliest), DAY_START)
+    hi = min(_time_to_min(latest), DAY_END)
+    hard = friend_busy + mine_hard
+    with_tentative = hard + mine_tentative
+
+    window = None
+    clean = _free_windows(with_tentative, int(duration_minutes), lo, hi)
+    if clean:
+        s = clean[0][0]
+        window = f"{_min_to_time(s)}-{_min_to_time(s + int(duration_minutes))}"
+    else:
+        fallback = _free_windows(hard, int(duration_minutes), lo, hi)
+        if fallback:
+            s = fallback[0][0]
+            window = f"{_min_to_time(s)}-{_min_to_time(s + int(duration_minutes))}"
     if not window:
         return "Failed to find a meeting time."
     meet_end = window.split("-")[1]
 
-    data = _fetch_json(f"{BASE_URL}/venues/{day}")
+    venues_raw = text_by_url.get(venues_url, "")
+    data = json.loads(venues_raw) if venues_raw else None
     if not data:
         return "Could not fetch venues."
     venues = data.get("venues", data) if isinstance(data, dict) else data
@@ -722,7 +901,15 @@ def plan_outing(
     if not valid_venues:
         return "No venues open for the hour after the meeting."
 
-    points = _locations(day, friend_list, my_x, my_y)
+    points = [(my_x, my_y)]
+    for f, u in location_urls.items():
+        raw = text_by_url.get(u, "")
+        if raw:
+            try:
+                loc = json.loads(raw)
+                points.append((loc["x"], loc["y"]))
+            except Exception:
+                pass
 
     best_cost = float("inf")
     best_point = None
