@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Pydantic models
+# Pydantic Models
 # ---------------------------------------------------------------------------
 
 class HealthResponse(BaseModel):
@@ -42,7 +42,7 @@ class TransactionBatchResponse(BaseModel):
     transactions: List[TransactionResult]
 
 # ---------------------------------------------------------------------------
-# Stateful Streaming Engine
+# Stateful Streaming Engine with Phase 2 Identity Signal Assessment
 # ---------------------------------------------------------------------------
 
 class RiskEngine:
@@ -50,18 +50,23 @@ class RiskEngine:
         self.WINDOW_SECONDS = 24 * 60 * 60
         self.t_max: float = 0.0
         
-        # Idempotency cache: txId -> (payload_string, risk_score)
+        # Idempotency cache: txId -> (payload_hash, risk_score)
         self.tx_cache: Dict[str, Tuple[str, float]] = {}
         
-        # Active edges state for O(1) lookups: txId -> (u, v, timestamp)
-        self.active_edges: Dict[str, Tuple[str, str, float]] = {}
+        # Active transactions store: txId -> Transaction
+        self.active_txs: Dict[str, Transaction] = {}
+        self.tx_timestamps: Dict[str, float] = {}
         
-        # Min-Heap for time-based pruning (handles out-of-order arrivals perfectly)
+        # Min-Heap for time-based pruning: (timestamp, txId)
         self.edge_heap: List[Tuple[float, str]] = []
         
-        # Multi-graph adjacency lists (tracking edge counts between nodes)
+        # Graph multi-edge representation
         self.adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
         self.rev_adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+        
+        # Phase 2 Identity Indexing
+        self.ip_to_txs: Dict[str, Set[str]] = collections.defaultdict(set)
+        self.device_to_txs: Dict[str, Set[str]] = collections.defaultdict(set)
 
     def clear(self):
         self.__init__()
@@ -70,173 +75,196 @@ class RiskEngine:
         s = iso_str.replace("Z", "+00:00")
         return datetime.datetime.fromisoformat(s).timestamp()
 
-    def _remove_edge_from_graph(self, u: str, v: str):
-        if self.adj[u][v] > 1:
-            self.adj[u][v] -= 1
-        else:
-            del self.adj[u][v]
-            if not self.adj[u]: del self.adj[u]
-            
-        if self.rev_adj[v][u] > 1:
-            self.rev_adj[v][u] -= 1
-        else:
-            del self.rev_adj[v][u]
-            if not self.rev_adj[v]: del self.rev_adj[v]
-
     def prune(self):
-        """Strict event-time pruning. Removes edges older than or exactly equal to 24h ago."""
+        """Removes transactions and graph/identity state older than 24h from current t_max."""
         cutoff = self.t_max - self.WINDOW_SECONDS
         
-        # Strict pruning: edges older than exactly 24h are removed
         while self.edge_heap and self.edge_heap[0][0] < cutoff:
             ts, txId = heapq.heappop(self.edge_heap)
             
-            # Verify this isn't a stale heap entry from a modified payload
-            if txId in self.active_edges and self.active_edges[txId][2] == ts:
-                u, v, _ = self.active_edges.pop(txId)
-                self._remove_edge_from_graph(u, v)
+            if txId in self.active_txs and self.tx_timestamps.get(txId) == ts:
+                tx = self.active_txs.pop(txId)
+                del self.tx_timestamps[txId]
+                
+                # Prune graph edges
+                u, v = tx.fromUserId, tx.toUserId
+                if self.adj[u][v] > 1:
+                    self.adj[u][v] -= 1
+                else:
+                    del self.adj[u][v]
+                    if not self.adj[u]: del self.adj[u]
+                    
+                if self.rev_adj[v][u] > 1:
+                    self.rev_adj[v][u] -= 1
+                else:
+                    del self.rev_adj[v][u]
+                    if not self.rev_adj[v]: del self.rev_adj[v]
 
-    def has_path(self, src: str, dst: str) -> bool:
-        """Standard BFS to detect reachability. Detects if a node is in a cycle if src == dst."""
-        if src not in self.adj: 
-            return False
+                # Prune identity indexes
+                if tx.ipAddress and tx.ipAddress in self.ip_to_txs:
+                    self.ip_to_txs[tx.ipAddress].discard(txId)
+                    if not self.ip_to_txs[tx.ipAddress]:
+                        del self.ip_to_txs[tx.ipAddress]
+                        
+                if tx.deviceId and tx.deviceId in self.device_to_txs:
+                    self.device_to_txs[tx.deviceId].discard(txId)
+                    if not self.device_to_txs[tx.deviceId]:
+                        del self.device_to_txs[tx.deviceId]
 
-        visited = {src}
-        queue = collections.deque([src])
-        
+    def _get_reachable_nodes(self, start: str, reverse: bool = False) -> Set[str]:
+        """BFS to get all reachable nodes in forward or reverse direction."""
+        graph = self.rev_adj if reverse else self.adj
+        if start not in graph:
+            return set()
+            
+        visited = set()
+        queue = collections.deque([start])
         while queue:
             curr = queue.popleft()
-            for nxt in self.adj.get(curr, {}):
-                if nxt == dst:
-                    return True
+            for nxt in graph.get(curr, {}):
                 if nxt not in visited:
                     visited.add(nxt)
                     queue.append(nxt)
-        return False
-
-    def get_ancestors(self, node: str) -> Set[str]:
-        """Returns all nodes that can reach the given node."""
-        if node not in self.rev_adj: return set()
-        
-        visited = set()
-        queue = collections.deque([node])
-        
-        while queue:
-            curr = queue.popleft()
-            for parent in self.rev_adj.get(curr, {}):
-                if parent not in visited:
-                    visited.add(parent)
-                    queue.append(parent)
         return visited
 
-    def has_indirect_path(self, src: str, dst: str) -> bool:
-        """Checks if src can reach dst ignoring the immediate direct edge (if it exists)."""
-        if src not in self.adj: return False
-        visited = {src}
-        queue = collections.deque([src])
+    def _calculate_structural_score(self, tx: Transaction) -> float:
+        """Evaluates graph topology changes (extensions, cycles, convergence, multi-loops)."""
+        src, dst = tx.fromUserId, tx.toUserId
         
-        while queue:
-            curr = queue.popleft()
-            for nxt in self.adj.get(curr, {}):
-                if curr == src and nxt == dst:
-                    continue  # Skip direct path
-                if nxt == dst:
-                    return True
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append(nxt)
-        return False
-
-    def score_transaction(self, u: str, v: str) -> float:
-        # 1. Cycle Detection (Return or Multi-Loop)
-        creates_cycle = self.has_path(v, u) or (u == v)
-        
-        if creates_cycle:
-            # Multi-Loop: The new edge completes a cycle, AND one of the endpoints
-            # is ALREADY part of an existing independent cycle.
-            if self.has_path(v, v) or self.has_path(u, u):
-                return 0.9
-            return 0.7
-
-        # 2. Convergence Detection
-        u_ancestors = self.get_ancestors(u)
-        v_ancestors = self.get_ancestors(v)
-        
-        # Convergence requires either a shared upstream ancestor, OR 
-        # a structural indirect path (meaning this new edge creates a 2nd path).
-        # A simple repeated direct edge will fail this and fall through to Extension.
-        if (u_ancestors & v_ancestors) or self.has_indirect_path(u, v):
-            return 0.5
-
-        # 3. Extension vs Isolated
-        u_active = (u in self.adj) or (u in self.rev_adj)
-        v_active = (v in self.adj) or (v in self.rev_adj)
-        
-        if u_active or v_active:
-            return 0.3
+        if src == dst:
+            return 0.85  # Self-loop anomaly
             
-        return 0.1
+        ancestors_src = self._get_reachable_nodes(src, reverse=True)
+        is_return_cycle = dst in ancestors_src or src == dst
+        
+        # Check convergence (dst reachable from multiple upstream nodes)
+        incoming_to_dst = len(self.rev_adj.get(dst, {}))
+        
+        if is_return_cycle:
+            # Multi-loop return vs single return
+            if incoming_to_dst > 1:
+                return 0.95
+            return 0.80
+        elif incoming_to_dst > 0:
+            return 0.50  # Structural convergence
+        elif src in self.adj:
+            return 0.25  # Extension
+            
+        return 0.05  # Isolated edge
 
-    def process(self, tx: Transaction) -> float:
-        # 1. Idempotency & Payload update check
-        payload_str = tx.model_dump_json(exclude_unset=True)
+    def _calculate_identity_signal(self, tx: Transaction) -> Tuple[float, float]:
+        """
+        Calculates Phase 2 Identity modifiers:
+        Returns: (identity_multiplier, risk_additive_bonus)
+        """
+        src, dst = tx.fromUserId, tx.toUserId
+        upstream_txs = [
+            self.active_txs[t] for t in self.active_txs 
+            if self.active_txs[t].toUserId == src
+        ]
+        
+        upstream_ips = {t.ipAddress for t in upstream_txs if t.ipAddress}
+        upstream_devices = {t.deviceId for t in upstream_txs if t.deviceId}
+        
+        mod_multiplier = 1.0
+        bonus_risk = 0.0
+        
+        # 1. Missing Identity Mid-Flow (Trail Breaking Evasion)
+        if upstream_txs and (upstream_ips or upstream_devices):
+            missing_ip = tx.ipAddress is None and len(upstream_ips) > 0
+            missing_dev = tx.deviceId is None and len(upstream_devices) > 0
+            
+            if missing_ip or missing_dev:
+                bonus_risk += 0.20  # Explicit evasion penalty
+                
+        # 2. Identity Shift Mid-Flow
+        if tx.deviceId and upstream_devices and tx.deviceId not in upstream_devices:
+            bonus_risk += 0.15
+        if tx.ipAddress and upstream_ips and tx.ipAddress not in upstream_ips:
+            bonus_risk += 0.10
+            
+        # 3. Shared Identity Across Disconnected Components
+        reachable_from_src = self._get_reachable_nodes(src) | {src}
+        reachable_from_dst = self._get_reachable_nodes(dst) | {dst}
+        connected_cluster = reachable_from_src | reachable_from_dst
+        
+        for attr, index in [(tx.ipAddress, self.ip_to_txs), (tx.deviceId, self.device_to_txs)]:
+            if attr and attr in index:
+                for existing_tx_id in index[attr]:
+                    existing_tx = self.active_txs[existing_tx_id]
+                    # Check if the shared identity spans disconnected nodes
+                    if (existing_tx.fromUserId not in connected_cluster and 
+                        existing_tx.toUserId not in connected_cluster):
+                        bonus_risk += 0.15
+                        break
+
+        # 4. Consistent Identity Across Active Path (Reinforces structural intent)
+        if tx.deviceId and tx.deviceId in upstream_devices:
+            mod_multiplier *= 1.15
+        if tx.ipAddress and tx.ipAddress in upstream_ips:
+            mod_multiplier *= 1.10
+            
+        return mod_multiplier, bonus_risk
+
+    def process_transaction(self, tx: Transaction) -> float:
+        ts = self.parse_timestamp(tx.createdAt)
+        payload_str = tx.model_dump_json()
+        
+        # Idempotency check
         if tx.txId in self.tx_cache:
             cached_payload, cached_score = self.tx_cache[tx.txId]
             if cached_payload == payload_str:
                 return cached_score
-            
-            # If payload differs, treat as update: remove old edge state first
-            if tx.txId in self.active_edges:
-                old_u, old_v, _ = self.active_edges.pop(tx.txId)
-                self._remove_edge_from_graph(old_u, old_v)
 
-        ts = self.parse_timestamp(tx.createdAt)
-
-        # 2. Update time and prune BEFORE scoring
+        # Update streaming max time & prune window
         if ts > self.t_max:
             self.t_max = ts
-        
         self.prune()
 
-        # 3. Handle expired transactions (strictly older than window)
-        if self.t_max > 0 and ts < self.t_max - self.WINDOW_SECONDS:
-            self.tx_cache[tx.txId] = (payload_str, 0.1)
-            return 0.1
-
-        # 4. Score based purely on prior state
-        u, v = tx.fromUserId, tx.toUserId
-        score = self.score_transaction(u, v)
-
-        # 5. Commit to graph state
-        self.active_edges[tx.txId] = (u, v, ts)
-        heapq.heappush(self.edge_heap, (ts, tx.txId))
-        self.adj[u][v] += 1
-        self.rev_adj[v][u] += 1
+        # Compute combined signals
+        struct_score = self._calculate_structural_score(tx)
+        ident_mult, ident_bonus = self._calculate_identity_signal(tx)
         
-        self.tx_cache[tx.txId] = (payload_str, score)
-        return score
+        final_score = min(1.0, max(0.0, (struct_score * ident_mult) + ident_bonus))
+        final_score = round(final_score, 4)
 
-# Global instance
+        # Update state graph & identity indexes
+        self.active_txs[tx.txId] = tx
+        self.tx_timestamps[tx.txId] = ts
+        heapq.heappush(self.edge_heap, (ts, tx.txId))
+        
+        self.adj[tx.fromUserId][tx.toUserId] += 1
+        self.rev_adj[tx.toUserId][tx.fromUserId] += 1
+        
+        if tx.ipAddress:
+            self.ip_to_txs[tx.ipAddress].add(tx.txId)
+        if tx.deviceId:
+            self.device_to_txs[tx.deviceId].add(tx.txId)
+            
+        self.tx_cache[tx.txId] = (payload_str, final_score)
+        return final_score
+
+# Engine Singleton
 engine = RiskEngine()
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# API Endpoints
 # ---------------------------------------------------------------------------
 
-@router.get("/ghost-chains/health")
-def ghost_chains_health() -> HealthResponse:
+@router.get("/ghost-chains/health", response_model=HealthResponse)
+def health_check():
     return HealthResponse(status="ok")
 
-@router.post("/ghost-chains/reset")
-def ghost_chains_reset(request: ResetRequest = ResetRequest()) -> ResetResponse:
-    if request.clearTransactions:
+@router.post("/ghost-chains/reset", response_model=ResetResponse)
+def reset_state(req: ResetRequest):
+    if req.clearTransactions:
         engine.clear()
-    return ResetResponse(clearTransactions=request.clearTransactions)
+    return ResetResponse(clearTransactions=req.clearTransactions)
 
-@router.post("/ghost-chains/transactions")
-def ghost_chains_transactions(request: TransactionBatchRequest) -> TransactionBatchResponse:
+@router.post("/ghost-chains/transactions", response_model=TransactionBatchResponse)
+def process_transactions(batch: TransactionBatchRequest):
     results = []
-    for tx in request.transactions:
-        score = engine.process(tx)
-        results.append(TransactionResult(txId=tx.txId, riskScore=round(score, 1)))
+    for tx in batch.transactions:
+        score = engine.process_transaction(tx)
+        results.append(TransactionResult(txId=tx.txId, riskScore=score))
     return TransactionBatchResponse(transactions=results)
