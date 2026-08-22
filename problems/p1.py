@@ -19,6 +19,14 @@ def compute_traversal(base_dur: float, start_t: float, obs_list: list) -> float:
     if not obs_list:
         return start_t + base_dur
         
+    # RULE 1: Cannot wait at nodes. If the edge is blocked exactly at start_t, we cannot enter it.
+    initial_speed = 1.0
+    for st, et, sf in obs_list:
+        if st <= start_t < et:
+            initial_speed *= sf
+    if initial_speed == 0.0:
+        return None
+        
     curr_t = start_t
     rem_d = float(base_dur)
     
@@ -38,15 +46,13 @@ def compute_traversal(base_dur: float, start_t: float, obs_list: list) -> float:
             if next_t == float('inf'):
                 return None
             curr_t = next_t
-            continue
+        else:
+            max_d = speed * (next_t - curr_t)
+            if rem_d <= max_d + 1e-6:
+                return curr_t + (rem_d / speed)
+            rem_d -= max_d
+            curr_t = next_t
             
-        max_d = speed * (next_t - curr_t)
-        if rem_d <= max_d:
-            return curr_t + (rem_d / speed)
-            
-        rem_d -= max_d
-        curr_t = next_t
-        
     return curr_t
 
 @router.post("/kan-cheong-delivery-driver")
@@ -55,6 +61,9 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
     responses = {}
     
     for case_id, case in batch.items():
+        case_start = time.time()
+        
+        # GLOBAL TIMEOUT: Preserve batch score if we are hitting the 10s ceiling
         if time.time() - global_start > 8.8:
             responses[case_id] = {"total_duration_sec": None, "arrival_time": None, "path": []}
             continue
@@ -105,11 +114,13 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
         static_visited = set()
         visited_states = set()
         
-        # Priority Queue: (est_total, curr_t, current_node, linked_path_node)
         pq = [(start_time + static_dists[start_coord]/global_max_speed, start_time, start_coord, None)]
         best_res = None
         
         while pq:
+            # PER-CASE TIMEOUT: Abort impossible cycles to save time for other cases
+            if time.time() - case_start > 0.6:
+                break
             if time.time() - global_start > 8.8:
                 break
                 
@@ -123,7 +134,7 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
                 if u in static_visited: continue
                 static_visited.add(u)
             else:
-                state = (u, round(curr_t, 1)) 
+                state = (u, round(curr_t, 3)) 
                 if state in visited_states: continue
                 visited_states.add(state)
                 
@@ -138,7 +149,9 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
         if best_res:
             arr_t, final_path_node = best_res
             
-            # Unwind the linked path memory struct
+            # Sync float math to exact integers to match ISO formatting expectations
+            arr_t = round(arr_t)
+            
             path_res = []
             curr_node = final_path_node
             while curr_node is not None:
@@ -147,7 +160,7 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
             path_res.reverse()
             
             responses[case_id] = {
-                "total_duration_sec": int(round(arr_t - start_time)),
+                "total_duration_sec": int(arr_t - start_time),
                 "arrival_time": to_iso(arr_t),
                 "path": path_res
             }
