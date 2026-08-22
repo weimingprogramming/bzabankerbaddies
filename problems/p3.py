@@ -34,12 +34,20 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     pot = state.get("pot", 0)
     max_raise = state.get("max_raise_to")
     min_raise = state.get("min_raise_to")
-    
+
     # 1. Evaluate hand strength
     if my_card is None:
         return {"action": "fold" if "fold" in legal_actions else "check"}
         
     strength = evaluate_strength(my_card, comm_card, rule)
+    
+    # ==========================================================
+    # CRITICAL FIX 1: Pot Control Pre-Reveal
+    # Cap strength at 0.70 before the community card is flipped.
+    # This forces the bot to only 'call' or 'check' early on!
+    # ==========================================================
+    if comm_card is None:
+        strength = min(strength, 0.70)
     
     # Helper to calculate legal aggressive bets
     def get_legal_bet(desired_amount):
@@ -47,10 +55,12 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
             return 0
         return max(min_raise, min(desired_amount, max_raise))
 
-    # 2. Aggressive Betting Logic
-    
-    # MONSTER HAND: Overbet the pot to stack the opponent!
-    if strength >= 0.85:
+    # ==========================================================
+    # CRITICAL FIX 2: Safer Monster Threshold
+    # Increased from 0.85 to 0.95. We only overbet the pot if 
+    # we have a Pair or the absolute highest card possible.
+    # ==========================================================
+    if strength >= 0.95:
         target_bet = pot * 2  
         legal_amount = get_legal_bet(target_bet)
         
