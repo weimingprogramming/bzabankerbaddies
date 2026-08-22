@@ -436,6 +436,9 @@ def _fetch_inbox() -> list:
     data = _fetch_json(f"{BASE_URL}/inbox")
     if isinstance(data, list):
         _inbox_cache = data
+    elif isinstance(data, dict):
+        # API may wrap emails in {"emails": [...]}
+        _inbox_cache = data.get("emails", data.get("inbox", []))
     return _inbox_cache
 
 
@@ -586,21 +589,18 @@ def _parse_schedule_response(raw: str) -> list:
 
 
 @mcp.tool()
-def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: str = "00:00", latest: str = "23:59") -> str:
+def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: str = "08:00", latest: str = "23:00") -> str:
     """
     Find the earliest available meeting time for the android and a group of friends on a given day.
     Checks everyone's schedule and the android's inbox commitments to find a free window.
     Use this when asked to find a time to meet, schedule a meeting, or find when everyone is free.
 
-    IMPORTANT: If the question specifies a time range (e.g., "between 18:00 and 23:00"),
-    you MUST pass the earliest and latest parameters to constrain the search.
-
     Args:
         day: The day of the week (e.g., 'Monday').
         friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
         duration_minutes: Required meeting duration in minutes (e.g., 60).
-        earliest: Start of allowed time range in HH:MM format. MUST be set when the question specifies a range. Default '00:00'.
-        latest: End of allowed time range in HH:MM format. MUST be set when the question specifies a range. Default '23:59'.
+        earliest: Start of allowed time range in HH:MM 24-hour format. Always set this from the question (e.g., '18:00'). Defaults to '08:00'.
+        latest: End of allowed time range in HH:MM 24-hour format. Always set this from the question (e.g., '23:00'). Defaults to '23:00'.
     """
     friend_list = [f.strip() for f in friends.split(",") if f.strip()]
     range_start = _time_to_min(earliest)
@@ -718,7 +718,7 @@ def find_meeting_point(day: str, friends: str, my_x: int, my_y: int) -> str:
 
 
 @mcp.tool()
-def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: int, earliest: str = "00:00", latest: str = "23:59") -> str:
+def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: int, earliest: str = "08:00", latest: str = "23:00") -> str:
     """
     Plan a complete outing: find meeting time, meeting point, and a suitable open venue.
     Use this when asked to plan an outing, get-together, or hangout with friends.
