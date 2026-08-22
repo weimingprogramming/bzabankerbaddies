@@ -531,20 +531,62 @@ def find_open_venues(day: str, time: str) -> str:
     data = _fetch_json(f"{BASE_URL}/venues/{day}")
     if not data:
         return "Could not fetch venues."
+    # API returns {"day": ..., "venues": [...]} with available: [[start, end], ...]
+    venues = data.get("venues", data) if isinstance(data, dict) else data
     check = _time_to_min(time)
     open_venues = []
-    for v in data:
-        o = _time_to_min(v["open"])
-        c = _time_to_min(v["close"])
-        if o <= check < c:
-            open_venues.append(v["name"])
+    for v in venues:
+        # Support both formats: {open, close} and {available: [[start, end], ...]}
+        if "available" in v:
+            for window in v["available"]:
+                o = _time_to_min(window[0])
+                c = _time_to_min(window[1])
+                if o <= check < c:
+                    open_venues.append(v["name"])
+                    break
+        else:
+            o = _time_to_min(v.get("open", "00:00"))
+            c = _time_to_min(v.get("close", "00:00"))
+            if o <= check < c:
+                open_venues.append(v["name"])
     if not open_venues:
         return "No venues are open at that time."
     return ", ".join(open_venues)
 
 
+def _parse_schedule_response(raw: str) -> list:
+    """Parse schedule API response into list of (start_min, end_min) tuples.
+    Handles both formats:
+      - {"busy": [["HH:MM","HH:MM"], ...]}
+      - [{"start":"HH:MM","end":"HH:MM"}, ...]
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    intervals = []
+    # Dict with "busy" key containing list of [start, end] arrays
+    if isinstance(data, dict):
+        busy = data.get("busy", [])
+        for block in busy:
+            if isinstance(block, list) and len(block) == 2:
+                intervals.append((_time_to_min(block[0]), _time_to_min(block[1])))
+            elif isinstance(block, dict):
+                intervals.append((_time_to_min(block["start"]), _time_to_min(block["end"])))
+    # List of objects
+    elif isinstance(data, list):
+        for block in data:
+            if isinstance(block, list) and len(block) == 2:
+                intervals.append((_time_to_min(block[0]), _time_to_min(block[1])))
+            elif isinstance(block, dict):
+                intervals.append((_time_to_min(block.get("start", "00:00")), _time_to_min(block.get("end", "00:00"))))
+    return intervals
+
+
 @mcp.tool()
-def find_meeting_time(day: str, friends: str, duration_minutes: int) -> str:
+def find_meeting_time(day: str, friends: str, duration_minutes: int, earliest: str = "00:00", latest: str = "23:59") -> str:
     """
     Find the earliest available meeting time for the android and a group of friends on a given day.
     Checks everyone's schedule and the android's inbox commitments to find a free window.
@@ -554,26 +596,22 @@ def find_meeting_time(day: str, friends: str, duration_minutes: int) -> str:
         day: The day of the week (e.g., 'Monday').
         friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
         duration_minutes: Required meeting duration in minutes (e.g., 60).
+        earliest: Earliest allowed start time in HH:MM format (default '00:00').
+        latest: Latest allowed end time in HH:MM format (default '23:59').
     """
     friend_list = [f.strip() for f in friends.split(",") if f.strip()]
+    range_start = _time_to_min(earliest)
+    range_end = _time_to_min(latest)
 
     # Fetch all friend schedules in parallel
     urls = [f"{BASE_URL}/schedule/{friend}/{day}" for friend in friend_list]
     all_busy = []
 
     with ThreadPoolExecutor(max_workers=max(len(urls), 1)) as pool:
-        futures = {pool.submit(_fetch_url, u): friend for u, friend in zip(urls, friend_list)}
+        futures = [pool.submit(_fetch_url, u) for u in urls]
         for fut in futures:
             raw = fut.result()
-            if raw:
-                try:
-                    blocks = json.loads(raw)
-                    for block in blocks:
-                        interval = _parse_interval(f"{block['start']}-{block['end']}")
-                        if interval:
-                            all_busy.append(interval)
-                except Exception:
-                    pass
+            all_busy.extend(_parse_schedule_response(raw))
 
     # Parse android's inbox for the day
     inbox_data = _parse_inbox_for_day(day)
@@ -589,8 +627,8 @@ def find_meeting_time(day: str, friends: str, duration_minutes: int) -> str:
         if interval:
             tentative_intervals.append(interval)
 
-    # Find free windows excluding hard-busy
-    free_windows = _find_free_windows(all_busy, duration_minutes)
+    # Find free windows within the specified range
+    free_windows = _find_free_windows(all_busy, duration_minutes, day_start=range_start, day_end=range_end)
 
     if not free_windows:
         return "No available meeting time found."
