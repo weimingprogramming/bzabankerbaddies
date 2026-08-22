@@ -3,6 +3,37 @@ from typing import Dict, Any
 
 router = APIRouter()
 
+def calculate_hand_strength(my_card: int, comm_card: int, rule: str) -> float:
+    # 1. NO COMMUNITY CARD YET (Pre-reveal)
+    if comm_card is None:
+        if rule == "obsidian":
+            return (14 - my_card) / 13.0  # Lower is better
+        elif rule == "amaranth":
+            # Target middle cards (6-9) because high community cards are likely
+            return 1.0 - (abs(my_card - 7) / 7.0)
+        else:
+            return my_card / 13.0  # Standard higher is better
+
+    # 2. POST-REVEAL EVALUATION
+    
+    # --- RULE: HIGHEST BELOW COMMUNITY CARD (Price is Right) ---
+    if rule == "amaranth":  # Or whichever rule code maps to this
+        if my_card <= comm_card:
+            # Valid hand: Scored between 0.50 and 1.0 based on how high it is
+            return 0.5 + (my_card / (2.0 * comm_card))
+        else:
+            # Busted hand (Over community card): Low score
+            return (my_card / 13.0) * 0.49
+
+    # --- RULE: LOWEST CARD WINS ---
+    elif rule == "obsidian":
+        return (14 - my_card) / 13.0
+
+    # --- RULE: STANDARD HIGHEST CARD WINS ---
+    else:
+        return my_card / 13.0
+
+
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     legal_actions = state.get("legal_actions", [])
@@ -16,71 +47,41 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
-    # ==========================================
-    # 1. COUNT ACTIVE OPPONENTS
-    # The more people in the hand, the weaker your card is.
-    # ==========================================
+    # Evaluate raw strength
+    strength = calculate_hand_strength(my_card, comm_card, rule)
+
+    # Pairs check (if applicable)
+    if comm_card is not None and my_card == comm_card and rule != "obsidian":
+        strength = 1.0
+
+    # Multiway scaling for 6-player table
     players = state.get("players", [])
     if isinstance(players, dict):
         players = list(players.values())
-        
-    # Count how many players haven't folded or busted
-    active_players = sum(1 for p in players if not p.get("folded", False) and not p.get("busted", False))
-    active_opps = max(1, active_players - 1)  # Minimum 1 to avoid math errors
-
-    # ==========================================
-    # 2. MULTIWAY MATH EVALUATION
-    # ==========================================
-    is_pair = (comm_card is not None and my_card == comm_card)
-    confidence = 0.0
-
-    if rule == "obsidian":
-        # Phase 3 Obsidian: Smallest wins, NO PAIRS.
-        # A 1 is a 1.0 base. We raise it to the power of opponents.
-        base_conf = (14 - my_card) / 13.0
-        confidence = base_conf ** active_opps
-        
+    active_opps = max(1, sum(1 for p in players if not p.get("folded", False) and not p.get("busted", False)) - 1)
+    
+    if strength < 1.0:
+        confidence = strength ** (active_opps * 0.8)
     else:
-        # Standard Rules: Largest wins, Pairs win.
-        if is_pair:
-            # We hit a pair. Unbeatable monster.
-            confidence = 1.0
-        else:
-            base_conf = my_card / 13.0
-            # Exponentially decrease confidence based on crowd size
-            confidence = base_conf ** active_opps
-            
-            # Apply a penalty for the threat of someone else hitting a pair!
-            if comm_card is None:
-                # Pre-reveal: ~7% chance per opponent they WILL pair
-                confidence = confidence * (1.0 - (active_opps * 0.07))
-            else:
-                # Post-reveal: ~8% chance per opponent they ALREADY paired
-                confidence = confidence * (1.0 - (active_opps * 0.08))
+        confidence = 1.0
 
     def get_legal_bet(desired_amount):
         if max_raise is None or min_raise is None: return 0
         return max(min_raise, min(desired_amount, max_raise))
 
-    # ==========================================
-    # 3. PHASE 3 TIGHT ACTION LOGIC
-    # ==========================================
-    
+    # --- ACTION EXECUTION ---
     if confidence >= 0.80:
-        # We have the nuts. Extract value from the bots.
-        legal_amount = get_legal_bet(int(pot * 0.5))
-        if "raise" in legal_actions: 
-            return {"action": "raise", "amount": legal_amount}
-        if "bet" in legal_actions: 
-            return {"action": "bet", "amount": legal_amount}
-            
-    if confidence >= 0.40:
-        # Good enough to stick around cheaply.
+        legal_amount = get_legal_bet(int(pot * 0.6))
+        if "raise" in legal_actions: return {"action": "raise", "amount": legal_amount}
+        if "bet" in legal_actions: return {"action": "bet", "amount": legal_amount}
+        if "call" in legal_actions: return {"action": "call"}
+
+    elif confidence >= 0.45:
         if "check" in legal_actions: return {"action": "check"}
         if "call" in legal_actions: return {"action": "call"}
-            
-    # Trash hand or too many players: Fold immediately and save chips
+
+    # Weak hand: Check if free, fold if bet to
     if "check" in legal_actions: return {"action": "check"}
     if "fold" in legal_actions: return {"action": "fold"}
-        
+
     return {"action": "call" if "call" in legal_actions else "check"}
