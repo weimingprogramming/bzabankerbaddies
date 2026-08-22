@@ -13,7 +13,6 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     max_raise = state.get("max_raise_to")
     min_raise = state.get("min_raise_to")
     
-    # Failsafe if hand hasn't started properly
     if my_card is None:
         return {"action": "check" if "check" in legal_actions else "fold"}
 
@@ -25,16 +24,31 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         
     else:
         # ==========================================
-        # 2. MATCH RULES TO PROPER NAMES
+        # 2. THE TRUE RULE MAPPING
         # ==========================================
         if rule == "obsidian":
-            # Leg 4: Smallest Card Wins
+            # Smallest wins: 1 is best (1.0), 13 is worst (0.0)
             confidence = (14 - my_card) / 13.0
+            
+        elif rule == "amaranth":
+            # Evens Win: Any Even beats any Odd. 
+            if my_card % 2 == 0:
+                confidence = 0.5 + (my_card / 26.0)  # Evens score 0.5 to 1.0
+            else:
+                confidence = my_card / 26.0          # Odds score 0.0 to 0.5
+                
+        elif rule == "cinnabar":
+            # Odds Win: Any Odd beats any Even.
+            if my_card % 2 != 0:
+                confidence = 0.5 + (my_card / 26.0)  # Odds score 0.5 to 1.0
+            else:
+                confidence = my_card / 26.0          # Evens score 0.0 to 0.5
+                
         else:
-            # Legs 1, 2, 3 (Verdigris, Cinnabar, Amaranth): Largest Wins
+            # verdigris: Largest wins (Standard)
             confidence = my_card / 13.0
 
-    # Pot Control: Never go all-in blind before the reveal
+    # Pot Control: Never go crazy before the community card reveals
     if comm_card is None:
         confidence = min(confidence, 0.60)
 
@@ -43,29 +57,23 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         return max(min_raise, min(desired_amount, max_raise))
 
     # ==========================================
-    # 3. ACTION LOGIC (Check > Fold fallback)
+    # 3. SMART ACTION LOGIC
     # ==========================================
     
-    # HIGH CONFIDENCE (>= 0.85): Bet/Raise to build the pot
     if confidence >= 0.85:
-        legal_amount = get_legal_bet(int(pot * 0.75))
+        # Safe value bet (50% of pot) instead of wild overbetting
+        legal_amount = get_legal_bet(int(pot * 0.5))
         if "raise" in legal_actions: 
             return {"action": "raise", "amount": legal_amount}
         if "bet" in legal_actions: 
             return {"action": "bet", "amount": legal_amount}
             
-    # MEDIUM CONFIDENCE (>= 0.50): Stay in the hand
     if confidence >= 0.50:
-        if "check" in legal_actions: 
-            return {"action": "check"}
-        if "call" in legal_actions: 
-            return {"action": "call"}
+        if "check" in legal_actions: return {"action": "check"}
+        if "call" in legal_actions: return {"action": "call"}
             
-    # LOW CONFIDENCE (< 0.50): Try to leave safely
-    if "check" in legal_actions:
-        return {"action": "check"}  # Always check instead of folding if allowed!
-    if "fold" in legal_actions:
-        return {"action": "fold"}
+    # Trash hand: Escape immediately
+    if "check" in legal_actions: return {"action": "check"}
+    if "fold" in legal_actions: return {"action": "fold"}
         
-    # Absolute failsafe 
-    return {"action": "check" if "check" in legal_actions else "call"}
+    return {"action": "call" if "call" in legal_actions else "check"}
