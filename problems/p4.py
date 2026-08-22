@@ -146,7 +146,7 @@ def _fetch_graph(map_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def recall(question: str) -> List[str]:
+def retrieve(query: str) -> List[str]:
     """
     Recalls relevant passages from the study materials to answer a question.
     Use this tool whenever you need to answer a factual question, recall information,
@@ -154,7 +154,7 @@ def recall(question: str) -> List[str]:
     Just pass the question and the tool returns the most relevant passages.
 
     Args:
-        question: The exact question you need to answer.
+        query: The exact question you need to answer.
     """
     import math
 
@@ -180,7 +180,7 @@ def recall(question: str) -> List[str]:
     idf = {w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()}
 
     # Extract query keywords
-    raw_q_words = re.findall(r'\b\w+\b', question.lower())
+    raw_q_words = re.findall(r'\b\w+\b', query.lower())
     q_words = {w for w in raw_q_words if w not in STOPWORDS}
 
     # Score each chunk by sum of IDF weights for matching query words
