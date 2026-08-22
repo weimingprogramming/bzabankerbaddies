@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict
 
 router = APIRouter()
 
-
 def get_q_candidates(max_can_buy, total_items):
     """
     Branching heuristic to prevent massive time complexity on large capital/quantities.
@@ -28,11 +27,23 @@ def get_q_candidates(max_can_buy, total_items):
         
     return list(sorted(set([max_can_buy, max_can_buy - 1, max_can_buy // 2, 0]), reverse=True))
 
+def _clean_state(inv, tl_state):
+    """Canonical, hashable form of (inventory, future timeline) for memoization."""
+    clean_inv = tuple(sorted((s, q) for s, q in inv.items() if q > 0))
+    clean_tl_list = []
+    for y in sorted(tl_state.keys()):
+        clean_stocks = tuple(sorted((s, q) for s, q in tl_state[y].items() if q > 0))
+        if clean_stocks:
+            clean_tl_list.append((y, clean_stocks))
+    clean_tl = tuple(clean_tl_list)
+    return clean_inv, clean_tl
+
+
 def solve_single(test_case: Dict[str, Any]) -> List[str]:
     energy_limit = test_case['energy']
     initial_capital = test_case['capital']
     timeline = test_case['timeline']
-    
+
     prices = {}
     init_tl = {}
     for y, stocks in timeline.items():
@@ -41,23 +52,17 @@ def solve_single(test_case: Dict[str, Any]) -> List[str]:
         for s, data in stocks.items():
             prices[y][s] = data['price']
             init_tl[y][s] = data['qty']
-            
+
     memo = {}
-    
-    def dfs(curr_year, energy, cap, inv, tl_state):
-        # 1. Clean inventory and timeline state for stable dictionary hashing
-        clean_inv = tuple(sorted((s, q) for s, q in inv.items() if q > 0))
-        clean_tl_list = []
-        for y in sorted(tl_state.keys()):
-            clean_stocks = tuple(sorted((s, q) for s, q in tl_state[y].items() if q > 0))
-            if clean_stocks:
-                clean_tl_list.append((y, clean_stocks))
-        clean_tl = tuple(clean_tl_list)
-        
-        state_key = (curr_year, energy, cap, clean_inv, clean_tl)
-        if state_key in memo:
-            return memo[state_key]
-            
+
+    def dfs_step(curr_year, energy, cap, inv, tl_state):
+        # Generator form of the search: rather than recursing directly on each
+        # jump, it yields the args of each sub-search and resumes with the
+        # result via generator.send(). run_dfs() below drives this with an
+        # explicit stack so recursion depth doesn't scale with `energy`
+        # (which caused RecursionError -> 500 on large-energy test cases).
+        clean_inv, _ = _clean_state(inv, tl_state)
+
         best_cap = -1
         best_acts = []
         
@@ -153,16 +158,47 @@ def solve_single(test_case: Dict[str, Any]) -> List[str]:
                     
                     # Ensure jump validity (can we eventually make it back home?)
                     if energy >= cost + cost_ret:
-                        res_cap, res_acts = dfs(next_year, energy - cost, next_cap, next_inv, temp_tl)
+                        res_cap, res_acts = yield (next_year, energy - cost, next_cap, next_inv, temp_tl)
                         if res_cap > best_cap:
                             best_cap = res_cap
                             jump_act = f"j-{curr_year}-{next_year}"
                             best_acts = sell_acts_step + buy_acts_step + [jump_act] + res_acts
-                            
-        memo[state_key] = (best_cap, best_acts)
-        return memo[state_key]
 
-    max_cap, final_acts = dfs("2037", energy_limit, initial_capital, {}, init_tl)
+        return best_cap, best_acts
+
+    def run_dfs(curr_year, energy, cap, inv, tl_state):
+        # Explicit-stack trampoline driving dfs_step generators, so search
+        # depth is bounded by heap memory rather than Python's call stack.
+        clean_inv, clean_tl = _clean_state(inv, tl_state)
+        root_key = (curr_year, energy, cap, clean_inv, clean_tl)
+        if root_key in memo:
+            return memo[root_key]
+
+        stack = [(dfs_step(curr_year, energy, cap, inv, tl_state), root_key)]
+        send_val = None
+
+        while stack:
+            gen, key = stack[-1]
+            try:
+                req = gen.send(send_val)
+            except StopIteration as done:
+                result = done.value
+                memo[key] = result
+                stack.pop()
+                send_val = result
+                continue
+
+            req_clean_inv, req_clean_tl = _clean_state(req[3], req[4])
+            req_key = (req[0], req[1], req[2], req_clean_inv, req_clean_tl)
+            if req_key in memo:
+                send_val = memo[req_key]
+            else:
+                stack.append((dfs_step(*req), req_key))
+                send_val = None
+
+        return memo[root_key]
+
+    max_cap, final_acts = run_dfs("2037", energy_limit, initial_capital, {}, init_tl)
     return final_acts
 
 @router.post("/stonks")
