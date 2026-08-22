@@ -8,6 +8,7 @@ import json
 import heapq
 import tiktoken
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Dict, Any
 
 # Initialize the MCP Server
 mcp = FastMCP("NurseryServer")
@@ -17,7 +18,6 @@ def get_agent_name() -> str:
     """Returns the name of the agent."""
     return "Render-Baby"
 
-
 @mcp.tool()
 def calculate_math(expression: str) -> float:
     """
@@ -26,13 +26,8 @@ def calculate_math(expression: str) -> float:
         expression: The complete math problem (e.g., "2 + 3 * 5"). Do NOT break it into steps.
     """
     try:
-        # Clean up the string just in case it passes 'x' instead of '*'
         expr = expression.replace("x", "*").replace("X", "*")
-        
-        # Strip out any non-math characters to safely evaluate
         expr = re.sub(r'[^0-9\+\-\*\/\.\(\)\ ]', '', expr)
-        
-        # Python's eval() natively respects order of operations
         return float(eval(expr))
     except Exception:
         return 0.0
@@ -44,26 +39,21 @@ def identify_shape(image_b64: str) -> str:
     Returns exactly one of these strings: 'rectangle', 'triangle', or 'circle'.
     """
     try:
-        # 1. Decode base64 to OpenCV format
         img_data = base64.b64decode(image_b64)
         np_arr = np.frombuffer(img_data, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
 
-        # 2. Extract mask (handles both transparent PNGs and white backgrounds)
         if len(img.shape) == 3 and img.shape[2] == 4:
-            mask = img[:, :, 3]  # Use alpha channel if present
+            mask = img[:, :, 3] 
         else:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
             _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
 
-        # 3. Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return "circle"
             
         cnt = max(contours, key=cv2.contourArea)
-        
-        # 4. Count vertices to determine shape
         epsilon = 0.04 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         
@@ -75,17 +65,16 @@ def identify_shape(image_b64: str) -> str:
         else:
             return "circle"
     except Exception:
-        # Fallback to prevent tool execution failure
         return "circle"
 
-
 @mcp.tool()
-def get_relevant_study_passages(question: str, urls: list[str] = None, text_content: str = None) -> list[str]:
+def get_relevant_study_passages(question: str, urls: List[str] = None, text_content: str = None) -> List[str]:
     """
-    Extracts the most relevant passages to answer a question from the provided URLs or raw text.
-    Guarantees the returned list of passages sum to under 900 tokens (using the o200k_base encoding).
+    Extracts the most relevant passages to answer a question or find a location from provided URLs or text.
     
-    CRITICAL FOR AGENT: Pass the 'urls' you were provided to fetch the documents directly.
+    AGENT INSTRUCTIONS:
+    If you need to find out a specific fact, name, or destination for a trip, use this tool.
+    Pass the list of URLs provided in the prompt to the `urls` parameter.
     """
     content = text_content or ""
 
@@ -111,14 +100,12 @@ def get_relevant_study_passages(question: str, urls: list[str] = None, text_cont
     if not content.strip():
         return ["No study material content could be retrieved."]
         
-    # Chunking strategy for optimal packing
     chunks = [c.strip() for c in re.split(r'\n\s*\n', content) if c.strip()]
     if len(chunks) < 3:
         chunks = [c.strip() for c in content.split('\n') if c.strip()]
     if len(chunks) < 3:
         chunks = [c.strip() + "." for c in content.split('.') if c.strip()]
         
-    # Scoring chunks based on word and bigram overlap with the question
     q_words = set(re.findall(r'\w+', question.lower()))
     
     def get_bigrams(s):
@@ -131,7 +118,6 @@ def get_relevant_study_passages(question: str, urls: list[str] = None, text_cont
     for chunk in chunks:
         c_words = set(re.findall(r'\w+', chunk.lower()))
         c_bigrams = get_bigrams(chunk)
-        # Bigrams are weighted heavier as they signify exact phrase matches (e.g., "sensor grid")
         score = len(q_words & c_words) + 2 * len(q_bigrams & c_bigrams)
         scored.append((score, chunk))
         
@@ -148,7 +134,6 @@ def get_relevant_study_passages(question: str, urls: list[str] = None, text_cont
     for score, chunk in scored:
         chunk_tokens = len(enc.encode(chunk))
         
-        # Stop or safely truncate if we approach the absolute ceiling
         if total_tokens + chunk_tokens > 880:
             allowed = 880 - total_tokens
             if allowed > 20:
@@ -163,101 +148,87 @@ def get_relevant_study_passages(question: str, urls: list[str] = None, text_cont
         
     return results
 
-
 @mcp.tool()
 def calculate_next_hop(
     current_node: str,
     destination: str,
-    adjacency: dict = None,
-    tolls: dict = None,
-    visited: list[str] = None,
-    hops_left: int = 999,
-    map_url: str = None
+    map_data_json: str,
+    visited_nodes: List[str] = None,
+    hops_left: int = 999
 ) -> str:
     """
-    Calculates the next node to travel to on a weighted directed graph to reach the destination with minimum cost.
-    Total cost = sum(edge weights) + sum(entry tolls).
+    Calculates the optimal next node to travel to on the map.
     
-    CRITICAL INSTRUCTIONS FOR AGENT:
-    1. If you only have a map_id, YOU must fetch the map data yourself (e.g., GET /graph?map_id=...) 
-       and pass the 'adjacency' and 'tolls' JSON dictionaries directly to this tool. Alternatively, pass the full absolute URL in 'map_url'.
-    2. You MUST maintain and pass the 'visited' list containing all previously visited nodes on this specific journey to prevent zero scores from revisiting.
-    
-    Args:
-        current_node: The node you are currently at.
-        destination: The target node you need to reach.
-        adjacency: dict of dicts, e.g. {"A": {"B": 4.0, "C": 2.0}}
-        tolls: dict of tolls for each node, e.g. {"A": 5.0, "B": 1.0}
-        visited: list of nodes already visited on this journey (to avoid revisiting).
-        hops_left: number of hops allowed (default 999 if unrestricted).
-        map_url: Optional full URL to fetch the graph JSON if adjacency/tolls are not provided.
-    
-    Returns:
-        The name of the next node to visit.
+    AGENT INSTRUCTIONS (CRITICAL):
+    1. You MUST fetch the map data yourself using an HTTP GET request to `/graph?map_id=<map_id>` BEFORE calling this tool.
+    2. Pass the ENTIRE raw JSON response string you receive directly into `map_data_json`. DO NOT attempt to parse it yourself.
+    3. You MUST maintain and pass the list of nodes you have already visited on this specific journey in `visited_nodes` (e.g., ["A", "B"]).
+    4. If the prompt gave you a maximum number of hops/moves, pass the remaining amount in `hops_left`.
+    5. Output EXACTLY the single node string returned by this tool as your next move. Do not invent steps.
     """
-    if isinstance(visited, str):
-        visited = [visited]
-    if visited is None:
-        visited = []
+    if visited_nodes is None:
+        visited_nodes = []
         
-    if adjacency is None or tolls is None:
-        if map_url:
-            try:
-                req = urllib.request.Request(map_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    adjacency = data.get('adjacency', {})
-                    tolls = data.get('tolls', {})
-            except Exception:
-                pass
-                
-    if adjacency is None: adjacency = {}
-    if tolls is None: tolls = {}
+    try:
+        # Safely handle in case the LLM parses it into a dictionary anyway
+        if isinstance(map_data_json, dict):
+            data = map_data_json
+        else:
+            data = json.loads(map_data_json)
+    except Exception as e:
+        return f"ERROR: Invalid map_data_json. You must fetch the map data and pass the raw JSON string. Details: {e}"
+        
+    adjacency = data.get("adjacency", {})
+    tolls = data.get("tolls", {})
     
-    # Nodes already visited on this journey (cannot be revisited per spec).
-    visited_set = set(visited)
+    if not adjacency:
+        return "ERROR: The map data is empty. Make sure you fetch from /graph?map_id=<map_id>."
+        
+    # Prevent revisiting nodes already traversed in previous turns
+    visited_set = set(visited_nodes)
     visited_set.add(current_node)
-
-    # Priority Queue State: (cost, hops_used, node, path)
-    # path tracks nodes in this Dijkstra run to prevent within-path cycles
+    
+    # pq stores: (cost, hops_used, current_node, path)
     pq = [(0.0, 0, current_node, [current_node])]
-    best_cost = {}
-
+    
+    # Pareto frontier for (cost, hops) at each node to prevent incorrect pruning
+    best_states = {}
+    
     while pq:
         cost, hops, u, path = heapq.heappop(pq)
-
-        # Arrived at destination
+        
         if u == destination:
             if len(path) > 1:
                 return path[1]
             return u
-
-        # Out of hop allowance
+            
         if hops >= hops_left:
             continue
-
-        # Prune dominated states
-        state_key = u
-        if best_cost.get(state_key, float('inf')) <= cost:
+            
+        # Check if this state is dominated by a previously found better path to `u`
+        dominated = False
+        for prev_cost, prev_hops in best_states.get(u, []):
+            if prev_cost <= cost and prev_hops <= hops:
+                dominated = True
+                break
+        if dominated:
             continue
-        best_cost[state_key] = cost
-
-        # Track nodes on current path to prevent within-path cycles
+            
+        if u not in best_states:
+            best_states[u] = []
+        best_states[u].append((cost, hops))
+        
         path_set = set(path)
-
-        # Explore neighbors
+        
         for v, weight in adjacency.get(u, {}).items():
-            # Skip nodes visited on prior journey steps
             if v in visited_set and v != destination:
                 continue
-            # Skip nodes already on this path (prevent Dijkstra cycles)
             if v in path_set:
                 continue
-
+                
             next_cost = cost + float(weight) + float(tolls.get(v, 0.0))
             next_hops = hops + 1
-
+            
             heapq.heappush(pq, (next_cost, next_hops, v, path + [v]))
-
-    # Fallback if no route found
-    return ""
+            
+    return "ERROR: No valid path found."
