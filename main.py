@@ -24,7 +24,7 @@ app.include_router(p3.router, prefix="", tags=["Problem 3 - Showdown"])
 app.include_router(p5.router, prefix="", tags=["Problem 5 - Ghost Chains"])
 
 # ADD P6 HERE FOR THE GRADER -> Exposes /stonks
-app.include_router(p6.router, prefix="", tags=["Problem 6 - Root"]) 
+app.include_router(p6.router, prefix="", tags=["Problem 6 - Root"])
 
 
 # ==========================================
@@ -37,6 +37,7 @@ app.include_router(p5.router, prefix="/p5", tags=["Problem 5"])
 
 # ADD P6 HERE FOR CONSISTENCY -> Exposes /p6/stonks
 app.include_router(p6.router, prefix="/p6", tags=["Problem 6 - Time Travelling Stonks"])
+
 
 
 @app.get("/health")
