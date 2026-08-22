@@ -1,21 +1,25 @@
+import logging
 from fastapi import APIRouter
 from typing import Dict, Any
+
+# Set up a logger that blasts straight through to Render's console
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
 router = APIRouter()
 
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
-    # 1. Log the previous hand's showdown to deduce the secret rules
+    # 1. Extract the intel
     recent = state.get("recent_hands", [])
     if recent:
         last_hand = recent[-1]
         
-        # Only log if it went to a showdown (we need to see their cards)
+        # Only log if we saw their cards
         if last_hand.get("showdown"):
             rule = state.get("table_rule", "unknown")
             leg = state.get("leg_number", "?")
             
-            # Extract hands and winner
             my_cards = last_hand["showdown"].get("your_cards", [])
             opp_cards = last_hand["showdown"].get("opponent_cards", [])
             chip_delta = last_hand.get("chip_delta", 0)
@@ -24,13 +28,12 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
             if chip_delta > 0: winner = "WE WON"
             elif chip_delta < 0: winner = "OPPONENT WON"
             
-            # flush=True forces Render to show the logs immediately
-            print(f"--- LEG {leg} | RULE: {rule} ---", flush=True)
-            print(f"My Cards: {my_cards}", flush=True)
-            print(f"Op Cards: {opp_cards}", flush=True)
-            print(f"Result:   {winner}\n", flush=True)
+            # WARNING level guarantees it prints immediately
+            logger.warning(
+                f"LEG {leg} | RULE: {rule} | Me: {my_cards} | Opp: {opp_cards} | {winner}"
+            )
 
-    # 2. Force the showdown by always Checking or Calling
+    # 2. Force the showdown
     valid_actions = state.get("valid_actions", [])
     
     if "check" in valid_actions:
