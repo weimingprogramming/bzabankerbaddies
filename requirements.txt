@@ -7,3 +7,4 @@ fastmcp
 numpy
 opencv-python-headless
 tiktoken
+opencv-python
