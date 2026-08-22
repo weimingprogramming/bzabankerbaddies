@@ -25,7 +25,6 @@ def compute_traversal(base_dur: int, start_t: float, obs_list: list) -> float:
     curr_t = start_t
     d = float(base_dur)
     
-    # Rule 1: We cannot enter an edge if it is currently completely blocked (speed 0.0)
     speed = 1.0
     for st, et, sf in obs_list:
         if st <= curr_t < et:
@@ -33,7 +32,6 @@ def compute_traversal(base_dur: int, start_t: float, obs_list: list) -> float:
     if speed == 0.0:
         return None
         
-    # Rule 2: Traverse the edge, adjusting time if speed changes midway
     while d > 1e-7:
         speed = 1.0
         next_event_t = float('inf')
@@ -68,9 +66,8 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
     responses = {}
     
     for case_id, case in batch.items():
-        # SOFT TIMEOUT PROTECTOR: If we are nearing 9 seconds, abort 
-        # and fill remaining cases with null to save the batch points.
-        if time.time() - global_start > 9.0:
+        # STRICT TIMEOUT: Abort at 8.5s to ensure response transmits safely
+        if time.time() - global_start > 8.5:
             responses[case_id] = {"total_duration_sec": None, "arrival_time": None, "path": []}
             continue
             
@@ -101,21 +98,37 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
             obs_dict[(eid, u, v)].append((st, et, sf))
             if et > T_max:
                 T_max = et
+
+        # --- A* ENHANCEMENT: Precompute static shortest paths (Reverse Dijkstra) ---
+        static_dists = {}
+        rev_pq = [(0, end_coord)]
+        while rev_pq:
+            d, u = heapq.heappop(rev_pq)
+            if u in static_dists:
+                continue
+            static_dists[u] = d
+            for v, eid, dur in graph[u]:
+                if v not in static_dists:
+                    heapq.heappush(rev_pq, (d + dur, v))
+                    
+        # If the destination is completely unreachable even without traffic, skip early
+        if start_coord not in static_dists:
+            responses[case_id] = {"total_duration_sec": None, "arrival_time": None, "path": []}
+            continue
                 
-        # Time-Dependent Dijkstra Search
+        # --- Time-Dependent A* Search ---
         static_visited = set()
         visited_states = set()
         
-        # Priority Queue stores: (current_time, current_node, path_so_far)
-        pq = [(start_time, start_coord, ())]
+        # Priority Queue stores: (estimated_total_time, current_time, current_node, path_so_far)
+        pq = [(start_time + static_dists[start_coord], start_time, start_coord, ())]
         best_res = None
         
         while pq:
-            # Abort heavy edge-cases to protect the batch score
-            if time.time() - global_start > 9.0:
+            if time.time() - global_start > 8.5:
                 break
                 
-            curr_t, u, path = heapq.heappop(pq)
+            est_total, curr_t, u, path = heapq.heappop(pq)
             
             if u == end_coord:
                 best_res = (curr_t, path)
@@ -127,8 +140,8 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 static_visited.add(u)
             else:
-                # Track exact state to prevent infinite loops while allowing time-burning cycles
-                state = (u, round(curr_t, 3)) 
+                # Track exact state to prevent infinite loops (round to 2 decimals to prevent float jitter)
+                state = (u, round(curr_t, 2)) 
                 if state in visited_states:
                     continue
                 visited_states.add(state)
@@ -136,8 +149,10 @@ def solve_delivery_driver(batch: Dict[str, Any]) -> Dict[str, Any]:
             for v, eid, base_dur in graph[u]:
                 obs_list = obs_dict.get((eid, u, v), [])
                 t_next = compute_traversal(base_dur, curr_t, obs_list)
-                if t_next is not None:
-                    heapq.heappush(pq, (t_next, v, path + (eid,)))
+                
+                if t_next is not None and v in static_dists:
+                    est_t = t_next + static_dists[v]
+                    heapq.heappush(pq, (est_t, t_next, v, path + (eid,)))
                     
         if best_res:
             arr_t, path_res = best_res
