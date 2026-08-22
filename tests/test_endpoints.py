@@ -4,13 +4,21 @@ from main import app
 client = TestClient(app)
 
 
-def test_health():
-  response = client.get("/health")
-  assert response.status_code == 200
-  assert response.json() == {"status": "ok"}
+def test_problem_2_sample_case():
+  payload = {
+      "payload": (
+          "ewoJImFkYXB0SW5wdXQiOiB7CgkJInVzZXIiOiB7CgkJCSJpZCI6ICJVNDIiLAoJCQkiZnVsbE5hbWUiOiAiSmFuZSBEb2UiCgkJfSwKCQkiYWN0aW9uIjogIkNSRUFURSIsCgkJIm1ldGFkYXRhIjogewoJCQkicHJpb3JpdHkiOiAiSElHSCIKCQl9Cgl9Cn0="
+      )
+  }
 
-
-def test_p1_placeholder():
-  response = client.post("/p1/solve", json={"payload": {"test": 123}})
+  response = client.post("/solve", json=payload)
   assert response.status_code == 200
-  assert response.json()["result"] == "ok"
+
+  data = response.json()
+  assert "adaptOutput" in data
+  assert data["adaptOutput"] == {
+      "id": "U42",
+      "name": "Jane Doe",
+      "action": "create",
+      "priority": 3,
+  }
