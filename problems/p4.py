@@ -146,7 +146,7 @@ def _fetch_graph(map_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def recall(question: str) -> List[str]:
+def get_relevant_study_pass(question: str) -> List[str]:
     """
     Recalls relevant passages from the study materials to answer a question.
     Use this tool whenever you need to answer a factual question, recall information,
