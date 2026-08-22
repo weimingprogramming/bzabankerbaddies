@@ -1,5 +1,7 @@
-from collections import deque
-from typing import List, Optional, Set, Dict
+import collections
+import datetime
+import heapq
+from typing import List, Optional, Set, Dict, Tuple
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
@@ -7,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Pydantic models (Unchanged)
+# Pydantic models
 # ---------------------------------------------------------------------------
 
 class HealthResponse(BaseModel):
@@ -43,182 +45,157 @@ class TransactionBatchResponse(BaseModel):
 # Stateful Streaming Engine
 # ---------------------------------------------------------------------------
 
-class TxNode:
-    """Wrapper to store parsed timestamp alongside a Transaction."""
-    __slots__ = ('tx', 'timestamp')
-    def __init__(self, tx: Transaction, ts: float):
-        self.tx = tx
-        self.timestamp = ts
-
-
 class RiskEngine:
     def __init__(self):
         self.WINDOW_SECONDS = 24 * 60 * 60
-        self.MAX_DEPTH = 6  # Reduced slightly to ensure tight bounds under load
-        
-        # O(1) Idempotency and result caching
-        self.tx_cache: Dict[str, float] = {}
-        
-        # Chronological queue for O(1) pruning
-        self.edges_queue: deque = deque() 
-        
-        # Bi-directional graph storing full transaction data for future phases
-        self.graph: Dict[str, Dict[str, List[Transaction]]] = {}
-        self.reverse_graph: Dict[str, Dict[str, List[Transaction]]] = {}
-        
-        # O(1) Node existence tracking (reference counting)
-        self.active_nodes: Dict[str, int] = {}
         self.t_max: float = 0.0
-
-    def parse_timestamp(self, iso_str: str) -> float:
-        import datetime
-        s = iso_str.replace("Z", "+00:00")
-        return datetime.datetime.fromisoformat(s).timestamp()
+        
+        # Idempotency cache: txId -> (payload_hash, risk_score)
+        self.tx_cache: Dict[str, Tuple[int, float]] = {}
+        
+        # Active edges state for O(1) lookups: txId -> (u, v, timestamp)
+        self.active_edges: Dict[str, Tuple[str, str, float]] = {}
+        
+        # Min-Heap for time-based pruning (handles out-of-order arrivals perfectly)
+        self.edge_heap: List[Tuple[float, str]] = []
+        
+        # Multi-graph adjacency lists (tracking edge counts between nodes)
+        self.adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+        self.rev_adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
 
     def clear(self):
         self.__init__()
 
-    def _add_node_ref(self, node: str):
-        self.active_nodes[node] = self.active_nodes.get(node, 0) + 1
+    def parse_timestamp(self, iso_str: str) -> float:
+        s = iso_str.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(s).timestamp()
 
-    def _remove_node_ref(self, node: str):
-        self.active_nodes[node] -= 1
-        if self.active_nodes[node] <= 0:
-            del self.active_nodes[node]
+    def _remove_edge_from_graph(self, u: str, v: str):
+        if self.adj[u][v] > 1:
+            self.adj[u][v] -= 1
+        else:
+            del self.adj[u][v]
+            if not self.adj[u]: del self.adj[u]
+            
+        if self.rev_adj[v][u] > 1:
+            self.rev_adj[v][u] -= 1
+        else:
+            del self.rev_adj[v][u]
+            if not self.rev_adj[v]: del self.rev_adj[v]
 
     def prune(self):
-        """O(1) amortized pruning using the chronologically ordered deque."""
+        """Strict event-time pruning using a Min-Heap to handle out-of-order data."""
         cutoff = self.t_max - self.WINDOW_SECONDS
-        while self.edges_queue and self.edges_queue[0].timestamp < cutoff:
-            old_tx = self.edges_queue.popleft()
-            u, v = old_tx.tx.fromUserId, old_tx.tx.toUserId
-            
-            # Remove from graph
-            if u in self.graph and v in self.graph[u]:
-                self.graph[u][v] = [t for t in self.graph[u][v] if t.txId != old_tx.tx.txId]
-                if not self.graph[u][v]:
-                    del self.graph[u][v]
-                    if not self.graph[u]:
-                        del self.graph[u]
-
-            # Remove from reverse_graph
-            if v in self.reverse_graph and u in self.reverse_graph[v]:
-                self.reverse_graph[v][u] = [t for t in self.reverse_graph[v][u] if t.txId != old_tx.tx.txId]
-                if not self.reverse_graph[v][u]:
-                    del self.reverse_graph[v][u]
-                    if not self.reverse_graph[v]:
-                        del self.reverse_graph[v]
-                    
-            # Decrement node reference counts
-            self._remove_node_ref(u)
-            self._remove_node_ref(v)
-
-    def has_path(self, src: str, dst: str, allow_direct: bool = True) -> bool:
-        if src not in self.graph:
-            return False
         
+        while self.edge_heap and self.edge_heap[0][0] < cutoff:
+            ts, txId = heapq.heappop(self.edge_heap)
+            
+            # Verify this isn't a stale heap entry from a modified payload
+            if txId in self.active_edges and self.active_edges[txId][2] == ts:
+                u, v, _ = self.active_edges.pop(txId)
+                self._remove_edge_from_graph(u, v)
+
+    def has_path(self, src: str, dst: str) -> bool:
+        """Standard BFS to detect reachability. Also detects if a node is in a cycle (src == dst)."""
+        if src not in self.adj:
+            return False
+
         visited = {src}
-        queue = deque([(src, 0)])
+        queue = collections.deque([src])
         
         while queue:
-            node, depth = queue.popleft()
-            if depth >= self.MAX_DEPTH:
-                continue
-                
-            for neighbor in self.graph.get(node, {}):
-                if neighbor == dst:
-                    if allow_direct or node != src:
-                        return True
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append((neighbor, depth + 1))
+            curr = queue.popleft()
+            for nxt in self.adj.get(curr, {}):
+                if nxt == dst:
+                    return True
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
         return False
 
     def get_ancestors(self, node: str) -> Set[str]:
-        if node not in self.reverse_graph:
+        """Returns all nodes that can reach the given node."""
+        if node not in self.rev_adj:
             return set()
+
         visited = set()
-        queue = deque([(node, 0)])
+        queue = collections.deque([node])
+        
         while queue:
-            curr, depth = queue.popleft()
-            if depth >= self.MAX_DEPTH:
-                continue
-            for parent in self.reverse_graph.get(curr, {}):
+            curr = queue.popleft()
+            for parent in self.rev_adj.get(curr, {}):
                 if parent not in visited:
                     visited.add(parent)
-                    queue.append((parent, depth + 1))
+                    queue.append(parent)
         return visited
 
-    def score_transaction(self, tx: Transaction) -> float:
-        u, v = tx.fromUserId, tx.toUserId
-
-        # 1. Self-Loop
+    def score_transaction(self, u: str, v: str) -> float:
+        # 1. Immediate Self-Loop
         if u == v:
             return 0.7
 
-        # 2. Return / Multi-Loop (Does v reach u?)
-        # If adding u->v creates a cycle, it means v already reaches u
-        if self.has_path(v, u):
-            # Check for multi-loop: does v reach u in multiple ways, or are they already in cycles?
-            # A simple heuristic for Multi-Loop: if u already reaches v (forming a tight cycle before this tx) 
-            # OR if v has multiple outgoing branches that can reach u.
-            if self.has_path(u, v): 
+        # 2. Cycle Detection
+        creates_cycle = self.has_path(v, u)
+        
+        if creates_cycle:
+            # Multi-Loop: The new edge completes a cycle, AND the target (or source) 
+            # is ALREADY part of an existing cycle. (Multiple return flows).
+            if self.has_path(v, v) or self.has_path(u, u):
                 return 0.9
             return 0.7
 
-        u_active = u in self.active_nodes
-        v_active = v in self.active_nodes
+        # 3. Convergence Detection
+        # Two distinct paths arrive at the destination.
+        u_ancestors = self.get_ancestors(u)
+        v_ancestors = self.get_ancestors(v)
+        
+        if (u_ancestors & v_ancestors) or self.has_path(u, v):
+            return 0.5
 
-        # 3. Convergence
-        if u_active and v_active:
-            # Case A: Direct bypass (u already reaches v via another path)
-            if self.has_path(u, v):
-                return 0.5
-            
-            # Case B: Shared upstream ancestor
-            u_ancestors = self.get_ancestors(u)
-            v_ancestors = self.get_ancestors(v)
-            if u_ancestors & v_ancestors:
-                return 0.5
-
-        # 4. Extension
+        # 4. Extension vs Isolated
+        u_active = (u in self.adj) or (u in self.rev_adj)
+        v_active = (v in self.adj) or (v in self.rev_adj)
+        
         if u_active or v_active:
             return 0.3
-
-        # 5. Isolated
+            
         return 0.1
 
     def process(self, tx: Transaction) -> float:
-        # Idempotency
+        # Idempotency & Payload difference check
+        payload_hash = hash(tx.model_dump_json(exclude_unset=True))
         if tx.txId in self.tx_cache:
-            return self.tx_cache[tx.txId]
+            cached_hash, cached_score = self.tx_cache[tx.txId]
+            if cached_hash == payload_hash:
+                return cached_score
+            # If payload differs, treat as update: remove old edge state first
+            if tx.txId in self.active_edges:
+                old_u, old_v, _ = self.active_edges.pop(tx.txId)
+                self._remove_edge_from_graph(old_u, old_v)
 
         ts = self.parse_timestamp(tx.createdAt)
 
-        # Stale transaction protection (older than window)
+        # Handle globally late transactions that arrive already expired
         if self.t_max > 0 and ts < self.t_max - self.WINDOW_SECONDS:
-            self.tx_cache[tx.txId] = 0.1
+            self.tx_cache[tx.txId] = (payload_hash, 0.1)
             return 0.1
 
-        # Time advancement
+        # Advance global time and prune expired state
         if ts > self.t_max:
             self.t_max = ts
             self.prune()
 
-        # Score BEFORE applying state change
-        score = self.score_transaction(tx)
+        # Generate score based on purely prior state
+        u, v = tx.fromUserId, tx.toUserId
+        score = self.score_transaction(u, v)
 
-        # Apply state change
-        node = TxNode(tx, ts)
-        self.edges_queue.append(node)
+        # Commit to graph state
+        self.active_edges[tx.txId] = (u, v, ts)
+        heapq.heappush(self.edge_heap, (ts, tx.txId))
+        self.adj[u][v] += 1
+        self.rev_adj[v][u] += 1
         
-        self.graph.setdefault(tx.fromUserId, {}).setdefault(tx.toUserId, []).append(tx)
-        self.reverse_graph.setdefault(tx.toUserId, {}).setdefault(tx.fromUserId, []).append(tx)
-        
-        self._add_node_ref(tx.fromUserId)
-        self._add_node_ref(tx.toUserId)
-
-        self.tx_cache[tx.txId] = score
+        self.tx_cache[tx.txId] = (payload_hash, score)
         return score
 
 # Global instance
