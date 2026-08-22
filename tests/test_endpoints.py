@@ -61,3 +61,23 @@ def test_showdown_trash_hand_folds():
   res = client.post("/move", json=payload)
   assert res.status_code == 200
   assert res.json() == {"action": "fold"}
+
+def test_showdown_pair_action():
+  # Holding pair (3 == 3) -> Should max raise now
+  payload = {
+      "protocol_version": 2,
+      "round": "post_reveal",
+      "your_number": 3,
+      "community_number": 3,
+      "pot": 20,
+      "to_call": 4,
+      "min_raise_to": 10,
+      "max_raise_to": 100,
+      "legal_actions": ["fold", "call", "raise"],
+      "your_stack": 180,
+  }
+  res = client.post("/move", json=payload)
+  assert res.status_code == 200
+  data = res.json()
+  assert data["action"] == "raise"
+  assert data["amount"] == 100  # Verify it max-raises the nuts

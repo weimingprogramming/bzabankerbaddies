@@ -21,84 +21,89 @@ class ShowdownPayload(BaseModel):
 
 def calculate_move(data: ShowdownPayload) -> Dict[str, Any]:
   legal = set(data.legal_actions)
-  your_num = data.your_number
-  comm_num = data.community_number
   is_post = data.round == "post_reveal"
   to_call = data.to_call
   pot = data.pot
+  your_num = data.your_number
 
-  has_pair = is_post and (comm_num is not None) and (your_num == comm_num)
+  # A pair is an automatic win unless the opponent has the exact same pair (a tie)
+  has_pair = is_post and (data.community_number is not None) and (your_num == data.community_number)
 
-  # Helper to safely construct bet/raise action
-  def make_raise_or_bet(target_amt: int) -> Dict[str, Any]:
+  # --- Helper Actions ---
+  def do_raise(target_amt: int) -> Dict[str, Any]:
     if data.min_raise_to is not None and data.max_raise_to is not None:
-      clamped_amt = max(
-          data.min_raise_to, min(target_amt, data.max_raise_to)
-      )
+      amt = max(data.min_raise_to, min(target_amt, data.max_raise_to))
       if "raise" in legal:
-        return {"action": "raise", "amount": clamped_amt}
+        return {"action": "raise", "amount": amt}
       if "bet" in legal:
-        return {"action": "bet", "amount": clamped_amt}
-    if "call" in legal:
-      return {"action": "call"}
-    if "check" in legal:
-      return {"action": "check"}
+        return {"action": "bet", "amount": amt}
+    return do_call()
+
+  def do_call() -> Dict[str, Any]:
+    if "call" in legal: return {"action": "call"}
+    if "check" in legal: return {"action": "check"}
     return {"action": "fold"}
 
-  # --- TIER 1: MONSTER HAND (PAIR POST-REVEAL) ---
-  if has_pair:
-    # Value bet / raise aggressively
-    target_amt = (
-        data.min_raise_to + max(4, pot // 2)
-        if data.min_raise_to
-        else pot + to_call
-    )
-    if "raise" in legal or "bet" in legal:
-      return make_raise_or_bet(target_amt)
-    if "call" in legal:
-      return {"action": "call"}
-    if "check" in legal:
-      return {"action": "check"}
+  def do_check_fold() -> Dict[str, Any]:
+    if "check" in legal: return {"action": "check"}
+    if "fold" in legal: return {"action": "fold"}
+    return {"action": "call"}
 
-  # --- TIER 2: STRONG HIGH CARDS (11, 12, 13) ---
-  if your_num >= 11:
-    if to_call == 0:
-      # Pre-reveal: raise high card for value
-      if not is_post and ("raise" in legal or "bet" in legal) and your_num >= 12:
-        return make_raise_or_bet(data.min_raise_to or 4)
-      if "check" in legal:
+  # --- POST-REVEAL (COMMUNITY CARD IS OUT) ---
+  if is_post:
+    if has_pair:
+      # We have the nuts. Go all-in or max raise to extract everything.
+      return do_raise(data.max_raise_to or 200)
+    
+    if your_num == 13:
+      # Almost guaranteed win (only loses if Gaston randomly paired the board). 
+      if to_call == 0:
+        return do_raise(pot) # Bet the pot for value
+      return do_call()       # Just call to keep them bluffing
+      
+    if your_num >= 11:
+      # Very strong high card.
+      if to_call == 0:
+        return do_raise(max(data.min_raise_to or 4, int(pot * 0.5)))
+      if to_call <= 50:
+        return do_call()
+      return do_check_fold()
+      
+    if your_num >= 8:
+      # Bluff catchers. Do not fold to tiny bets anymore.
+      if to_call == 0:
         return {"action": "check"}
-    else:
-      # Facing a bet: call moderate bets (pot odds)
-      if to_call <= max(8, pot * 0.45) and "call" in legal:
-        return {"action": "call"}
-      if "fold" in legal:
-        return {"action": "fold"}
+      if to_call <= 15:
+        return do_call()
+      return do_check_fold()
+      
+    # Trash (1-7). Give up immediately if faced with a bet.
+    return do_check_fold()
 
-  # --- TIER 3: MEDIUM CARDS (8, 9, 10) ---
-  if your_num >= 8:
-    if to_call == 0:
-      if "check" in legal:
-        return {"action": "check"}
-    else:
-      # Only call cheap forced bets / mini-bets
-      if to_call <= 3 and "call" in legal:
-        return {"action": "call"}
-      if "fold" in legal:
-        return {"action": "fold"}
+  # --- PRE-REVEAL (NO COMMUNITY CARD YET) ---
+  else:
+    if your_num == 13:
+      # Raise big with the best card, just call if they shoved
+      if to_call <= 30:
+        return do_raise(max(data.min_raise_to or 6, 12))
+      return do_call()
 
-  # --- TIER 4: WEAK CARDS (1 - 7) ---
-  if to_call == 0:
-    if "check" in legal:
-      return {"action": "check"}
-    if "call" in legal:
-      return {"action": "call"}
+    if your_num >= 11:
+      # Value raise small bets, call medium bets
+      if to_call <= 5:
+        return do_raise(max(data.min_raise_to or 6, 10))
+      if to_call <= 15:
+        return do_call()
+      return do_check_fold()
 
-  if "fold" in legal:
-    return {"action": "fold"}
-  if "check" in legal:
-    return {"action": "check"}
-  return {"action": "call"}
+    if your_num >= 8:
+      # Keep Gaston honest by calling small pre-reveal raises
+      if to_call <= 8:
+        return do_call()
+      return do_check_fold()
+
+    # Trash (1-7). Fold immediately to avoid the slow bleed.
+    return do_check_fold()
 
 
 @router.post("/move")
