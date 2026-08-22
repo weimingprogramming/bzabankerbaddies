@@ -1,5 +1,4 @@
 import os
-
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -15,6 +14,9 @@ async def lifespan(app: FastAPI):
         yield
 
 app = FastAPI(title="Competition Service Engine", lifespan=lifespan)
+
+# 3. CRITICAL FIX: You must mount the MCP app so the /mcp endpoint exists!
+app.mount("/mcp", mcp_app)
 
 # Mount root endpoints directly
 app.include_router(p1.router, prefix="", tags=["Problem 1 - Delivery Driver"])
