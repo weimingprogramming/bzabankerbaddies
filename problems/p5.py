@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Pydantic Models
+# Pydantic Models (Forward Compatible)
 # ---------------------------------------------------------------------------
 
 class HealthResponse(BaseModel):
@@ -42,7 +42,7 @@ class TransactionBatchResponse(BaseModel):
     transactions: List[TransactionResult]
 
 # ---------------------------------------------------------------------------
-# Stateful Streaming Engine with Phase 2 Identity Signal Assessment
+# State Engine: Phase 1 (Topology) + Phase 2 (Identity) + Phase 3 (Value)
 # ---------------------------------------------------------------------------
 
 class RiskEngine:
@@ -53,18 +53,18 @@ class RiskEngine:
         # Idempotency cache: txId -> (payload_hash, risk_score)
         self.tx_cache: Dict[str, Tuple[str, float]] = {}
         
-        # Active transactions store: txId -> Transaction
+        # Active state tracking
         self.active_txs: Dict[str, Transaction] = {}
         self.tx_timestamps: Dict[str, float] = {}
         
-        # Min-Heap for time-based pruning: (timestamp, txId)
+        # Priority Queue for 24h lookback window pruning: (timestamp, txId)
         self.edge_heap: List[Tuple[float, str]] = []
         
-        # Graph multi-edge representation
+        # Structural Graph Adjacency
         self.adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
         self.rev_adj: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
         
-        # Phase 2 Identity Indexing
+        # Phase 2 Identity Indices
         self.ip_to_txs: Dict[str, Set[str]] = collections.defaultdict(set)
         self.device_to_txs: Dict[str, Set[str]] = collections.defaultdict(set)
 
@@ -76,7 +76,7 @@ class RiskEngine:
         return datetime.datetime.fromisoformat(s).timestamp()
 
     def prune(self):
-        """Removes transactions and graph/identity state older than 24h from current t_max."""
+        """Strict 24-hour event-time window pruning across all indices."""
         cutoff = self.t_max - self.WINDOW_SECONDS
         
         while self.edge_heap and self.edge_heap[0][0] < cutoff:
@@ -86,7 +86,7 @@ class RiskEngine:
                 tx = self.active_txs.pop(txId)
                 del self.tx_timestamps[txId]
                 
-                # Prune graph edges
+                # Prune Graph Edges
                 u, v = tx.fromUserId, tx.toUserId
                 if self.adj[u][v] > 1:
                     self.adj[u][v] -= 1
@@ -100,7 +100,7 @@ class RiskEngine:
                     del self.rev_adj[v][u]
                     if not self.rev_adj[v]: del self.rev_adj[v]
 
-                # Prune identity indexes
+                # Prune Identity Maps
                 if tx.ipAddress and tx.ipAddress in self.ip_to_txs:
                     self.ip_to_txs[tx.ipAddress].discard(txId)
                     if not self.ip_to_txs[tx.ipAddress]:
@@ -112,7 +112,6 @@ class RiskEngine:
                         del self.device_to_txs[tx.deviceId]
 
     def _get_reachable_nodes(self, start: str, reverse: bool = False) -> Set[str]:
-        """BFS to get all reachable nodes in forward or reverse direction."""
         graph = self.rev_adj if reverse else self.adj
         if start not in graph:
             return set()
@@ -128,35 +127,27 @@ class RiskEngine:
         return visited
 
     def _calculate_structural_score(self, tx: Transaction) -> float:
-        """Evaluates graph topology changes (extensions, cycles, convergence, multi-loops)."""
+        """Phase 1: Graph Topology Evaluation."""
         src, dst = tx.fromUserId, tx.toUserId
         
         if src == dst:
-            return 0.85  # Self-loop anomaly
+            return 0.85
             
         ancestors_src = self._get_reachable_nodes(src, reverse=True)
         is_return_cycle = dst in ancestors_src or src == dst
-        
-        # Check convergence (dst reachable from multiple upstream nodes)
         incoming_to_dst = len(self.rev_adj.get(dst, {}))
         
         if is_return_cycle:
-            # Multi-loop return vs single return
-            if incoming_to_dst > 1:
-                return 0.95
-            return 0.80
+            return 0.95 if incoming_to_dst > 1 else 0.80
         elif incoming_to_dst > 0:
-            return 0.50  # Structural convergence
+            return 0.50  # Convergence
         elif src in self.adj:
             return 0.25  # Extension
             
-        return 0.05  # Isolated edge
+        return 0.05  # Isolated Edge
 
     def _calculate_identity_signal(self, tx: Transaction) -> Tuple[float, float]:
-        """
-        Calculates Phase 2 Identity modifiers:
-        Returns: (identity_multiplier, risk_additive_bonus)
-        """
+        """Phase 2: Identity Fingerprint Evaluation."""
         src, dst = tx.fromUserId, tx.toUserId
         upstream_txs = [
             self.active_txs[t] for t in self.active_txs 
@@ -169,66 +160,94 @@ class RiskEngine:
         mod_multiplier = 1.0
         bonus_risk = 0.0
         
-        # 1. Missing Identity Mid-Flow (Trail Breaking Evasion)
+        # Mid-Flow Identity Evasion (Dropped IP or Device)
         if upstream_txs and (upstream_ips or upstream_devices):
-            missing_ip = tx.ipAddress is None and len(upstream_ips) > 0
-            missing_dev = tx.deviceId is None and len(upstream_devices) > 0
-            
-            if missing_ip or missing_dev:
-                bonus_risk += 0.20  # Explicit evasion penalty
+            if (tx.ipAddress is None and upstream_ips) or (tx.deviceId is None and upstream_devices):
+                bonus_risk += 0.20
                 
-        # 2. Identity Shift Mid-Flow
+        # Mid-Flow Identity Shift
         if tx.deviceId and upstream_devices and tx.deviceId not in upstream_devices:
             bonus_risk += 0.15
         if tx.ipAddress and upstream_ips and tx.ipAddress not in upstream_ips:
             bonus_risk += 0.10
             
-        # 3. Shared Identity Across Disconnected Components
-        reachable_from_src = self._get_reachable_nodes(src) | {src}
-        reachable_from_dst = self._get_reachable_nodes(dst) | {dst}
-        connected_cluster = reachable_from_src | reachable_from_dst
-        
+        # Shared Identity Across Disconnected Components
+        connected_cluster = self._get_reachable_nodes(src) | self._get_reachable_nodes(dst) | {src, dst}
         for attr, index in [(tx.ipAddress, self.ip_to_txs), (tx.deviceId, self.device_to_txs)]:
             if attr and attr in index:
                 for existing_tx_id in index[attr]:
-                    existing_tx = self.active_txs[existing_tx_id]
-                    # Check if the shared identity spans disconnected nodes
-                    if (existing_tx.fromUserId not in connected_cluster and 
-                        existing_tx.toUserId not in connected_cluster):
+                    ex_tx = self.active_txs[existing_tx_id]
+                    if ex_tx.fromUserId not in connected_cluster and ex_tx.toUserId not in connected_cluster:
                         bonus_risk += 0.15
                         break
 
-        # 4. Consistent Identity Across Active Path (Reinforces structural intent)
+        # Consistent Identity Alignment
         if tx.deviceId and tx.deviceId in upstream_devices:
-            mod_multiplier *= 1.15
-        if tx.ipAddress and tx.ipAddress in upstream_ips:
             mod_multiplier *= 1.10
+        if tx.ipAddress and tx.ipAddress in upstream_ips:
+            mod_multiplier *= 1.05
             
         return mod_multiplier, bonus_risk
+
+    def _calculate_value_signal(self, tx: Transaction) -> float:
+        """
+        Phase 3: Amount Progression inside Inferred Flow Segments.
+        Detects expected value decay vs. value trajectory reversals.
+        """
+        src = tx.fromUserId
+        upstream_txs = [
+            self.active_txs[t] for t in self.active_txs 
+            if self.active_txs[t].toUserId == src
+        ]
+        
+        if not upstream_txs:
+            return 0.0  # Isolated or flow origin
+            
+        max_upstream_amount = max(t.amount for t in upstream_txs)
+        
+        # 1. Value Trajectory Reversal (Amount increases mid-flow)
+        if tx.amount > max_upstream_amount:
+            # Significant risk penalty for breaking expected flow decay
+            overage_ratio = (tx.amount - max_upstream_amount) / max_upstream_amount
+            return min(0.35, 0.25 + (overage_ratio * 0.10))
+            
+        # 2. Consistent Value Decay (Expected Layering Pattern)
+        decay_ratio = tx.amount / max_upstream_amount
+        if 0.85 <= decay_ratio <= 1.0:
+            # Standard layering progression -> No extra risk added (lowest relative score)
+            return 0.0
+            
+        # 3. Discontinuous Value Jump/Drop
+        if decay_ratio < 0.50:
+            return 0.10
+            
+        return 0.05
 
     def process_transaction(self, tx: Transaction) -> float:
         ts = self.parse_timestamp(tx.createdAt)
         payload_str = tx.model_dump_json()
         
-        # Idempotency check
+        # Idempotency Check
         if tx.txId in self.tx_cache:
             cached_payload, cached_score = self.tx_cache[tx.txId]
             if cached_payload == payload_str:
                 return cached_score
 
-        # Update streaming max time & prune window
+        # Stream Time Advance & Pruning
         if ts > self.t_max:
             self.t_max = ts
         self.prune()
 
-        # Compute combined signals
+        # Multi-Signal Calculations
         struct_score = self._calculate_structural_score(tx)
         ident_mult, ident_bonus = self._calculate_identity_signal(tx)
+        val_bonus = self._calculate_value_signal(tx)
         
-        final_score = min(1.0, max(0.0, (struct_score * ident_mult) + ident_bonus))
-        final_score = round(final_score, 4)
+        # Composite Scoring Formula
+        raw_score = (struct_score * ident_mult) + ident_bonus + val_bonus
+        final_score = round(min(1.0, max(0.0, raw_score)), 4)
 
-        # Update state graph & identity indexes
+        # Update Active Graph & State
         self.active_txs[tx.txId] = tx
         self.tx_timestamps[tx.txId] = ts
         heapq.heappush(self.edge_heap, (ts, tx.txId))
@@ -244,11 +263,11 @@ class RiskEngine:
         self.tx_cache[tx.txId] = (payload_str, final_score)
         return final_score
 
-# Engine Singleton
+# Service Instance
 engine = RiskEngine()
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# API Routes
 # ---------------------------------------------------------------------------
 
 @router.get("/ghost-chains/health", response_model=HealthResponse)
