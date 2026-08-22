@@ -3,106 +3,86 @@ from typing import Dict, Any
 
 router = APIRouter()
 
+@router.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+def evaluate_hand_strength(state: Dict[str, Any]) -> float:
+    """Returns normalized hand strength from 0.0 (garbage) to 1.0 (unbeatable)."""
+    table_rule = state.get("table_rule", "standard").lower()
+    your_num = state.get("your_number")
+    comm_num = state.get("community_number")
+    
+    if your_num is None:
+        return 0.5
+
+    # Leg 2: Obsidian (Smallest Wins, pairs disabled)
+    if table_rule == "obsidian":
+        return (14 - your_num) / 13.0
+
+    # Leg 3: Amaranth (Modular Match distance to community card)
+    if table_rule == "amaranth":
+        if comm_num is not None:
+            if your_num == comm_num:
+                return 1.0  # Pair beats non-pairs
+            dist = (13 + comm_num - your_num) % 13
+            return (13 - dist) / 13.0
+        return (14 - your_num) / 13.0
+
+    # Leg 1 & 4: Verdigris / Cinnabar / Standard (Highest Card or Pair)
+    if comm_num is not None and your_num == comm_num:
+        return 1.0  # Pair beats non-pairs
+    
+    return your_num / 13.0
+
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
     legal_actions = state.get("legal_actions", [])
-    my_card = state.get("your_number")
-    comm_card = state.get("community_number")
-    rule = state.get("table_rule", "unknown")
-    pot = state.get("pot", 1)  # Avoid division by zero
-    max_raise = state.get("max_raise_to")
+    to_call = state.get("to_call", 0)
+    your_stack = state.get("your_stack", 200)
+    pot = state.get("pot", 1)
     min_raise = state.get("min_raise_to")
-    call_amount = state.get("call_amount", 0)
-    
-    if my_card is None:
-        return {"action": "check" if "check" in legal_actions else "fold"}
+    max_raise = state.get("max_raise_to")
+    players = state.get("players", [])
 
-    is_pair = (comm_card is not None and my_card == comm_card)
-    tier = "trash"  # Categories: "monster", "strong", "trash"
+    strength = evaluate_hand_strength(state)
 
-    # ==========================================
-    # 1. HARD-CODED HAND TIER CLASSIFICATION
-    # ==========================================
-    if comm_card is None:
-        # Pre-reveal tight classification
-        if rule == "obsidian":
-            tier = "monster" if my_card in [1, 2] else ("strong" if my_card in [3, 4] else "trash")
-        elif rule == "amaranth":
-            tier = "strong" if my_card in [6, 7, 8] else "trash"
-        else:
-            tier = "monster" if my_card == 13 else ("strong" if my_card in [11, 12] else "trash")
-    else:
-        # Post-reveal exact classification
-        if rule == "obsidian":
-            # Smallest wins, pairs are worthless
-            if my_card in [1, 2]:
-                tier = "monster"
-            elif my_card in [3, 4]:
-                tier = "strong"
-            else:
-                tier = "trash"
+    # 1. Detect opponent aggression (all-ins or huge bets relative to stack/pot)
+    opponent_all_in = any(p.get("all_in", False) for p in players if p.get("name") != "you")
+    is_massive_bet = to_call >= (your_stack * 0.5) or opponent_all_in
 
-        elif rule == "amaranth":
-            # Modular match
-            score = (13 + comm_card - my_card) % 13
-            if is_pair or score == 0:
-                tier = "monster"
-            elif score in [11, 12]:
-                tier = "strong"
-            else:
-                tier = "trash"
-
-        else:
-            # Leg 1 / Leg 4: Largest wins
-            if is_pair or my_card == 13:
-                tier = "monster"
-            elif my_card in [11, 12]:
-                tier = "strong"
-            else:
-                tier = "trash"
-
-    # Helper for disciplined bet sizing
-    def get_value_bet_amount(pct=0.4):
-        if max_raise is None or min_raise is None:
-            return 0
-        desired = int(pot * pct)
-        return max(min_raise, min(desired, max_raise))
-
-    # ==========================================
-    # 2. DISCIPLINED ACTION LOGIC
-    # ==========================================
-
-    # A. TIER 1: MONSTER HANDS -> VALUE BET / RAISE / CALL ANY
-    if tier == "monster":
-        bet_amt = get_value_bet_amount(0.5)
-        if "raise" in legal_actions and bet_amt > 0:
-            return {"action": "raise", "amount": bet_amt}
-        if "bet" in legal_actions and bet_amt > 0:
-            return {"action": "bet", "amount": bet_amt}
-        if "call" in legal_actions:
-            return {"action": "call"}
-        if "check" in legal_actions:
-            return {"action": "check"}
-
-    # B. TIER 2: STRONG HANDS -> CHECK FOR FREE, CALL ONLY ON GOOD ODDS
-    elif tier == "strong":
-        if "check" in legal_actions:
-            return {"action": "check"}
-            
-        # Pot odds filter: ONLY call if the call cost is <= 35% of the pot (3:1 odds)
-        # AND the raw call_amount is reasonably small (e.g., <= 5 chips)
-        if "call" in legal_actions:
-            if call_amount <= (pot * 0.35) and call_amount <= 5:
+    # 2. Facing heavy pressure / All-In: Demand near-nut hand (strength >= 0.92)
+    if is_massive_bet:
+        if strength >= 0.92:
+            if "call" in legal_actions:
                 return {"action": "call"}
-            else:
-                # Opponent bet too big -> Fold marginal hands!
-                return {"action": "fold"}
-
-    # C. TIER 3: TRASH HANDS -> CHECK IF FREE, IMMEDIATELY FOLD TO BETS
-    if "check" in legal_actions:
-        return {"action": "check"}
-    
-    if "fold" in legal_actions:
+        if "check" in legal_actions:
+            return {"action": "check"}
         return {"action": "fold"}
 
-    return {"action": "check" if "check" in legal_actions else "fold"}
+    # 3. Strong Hands: Value raise or bet against standard action
+    if strength >= 0.80:
+        if "raise" in legal_actions and min_raise is not None and max_raise is not None:
+            target_raise = int(min_raise + 0.3 * (max_raise - min_raise))
+            amount = max(min_raise, min(target_raise, max_raise))
+            return {"action": "raise", "amount": amount}
+        if "bet" in legal_actions and min_raise is not None and max_raise is not None:
+            amount = max(min_raise, min(min_raise + 6, max_raise))
+            return {"action": "bet", "amount": amount}
+        if "call" in legal_actions:
+            return {"action": "call"}
+
+    # 4. Moderate Hands: Call small/medium bets using pot odds
+    pot_odds_threshold = to_call / max(pot + to_call, 1)
+    if strength >= 0.50:
+        if "check" in legal_actions:
+            return {"action": "check"}
+        # Only call if hand strength comfortably exceeds pot odds ratio
+        if "call" in legal_actions and pot_odds_threshold <= 0.35 and to_call <= (your_stack * 0.20):
+            return {"action": "call"}
+
+    # 5. Weak Hands: Free checks only, otherwise fold
+    if "check" in legal_actions:
+        return {"action": "check"}
+
+    return {"action": "fold"}
