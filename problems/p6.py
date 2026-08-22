@@ -1,7 +1,16 @@
-from fastapi import FastAPI
 from typing import List, Dict, Any
+import collections
+import datetime
+import hashlib
+import heapq
+import json
+from typing import List, Optional, Set, Dict, Tuple
 
-app = FastAPI()
+from fastapi import APIRouter
+from pydantic import BaseModel, ConfigDict
+
+router = APIRouter()
+
 
 def get_q_candidates(max_can_buy, total_items):
     """
@@ -156,7 +165,7 @@ def solve_single(test_case: Dict[str, Any]) -> List[str]:
     max_cap, final_acts = dfs("2037", energy_limit, initial_capital, {}, init_tl)
     return final_acts
 
-@app.post("/stonks")
+@router.post("/stonks")
 def stonks_endpoint(payload: List[Dict[str, Any]]):
     """
     Takes an array of test cases (JSON objects) and processes them sequentially.

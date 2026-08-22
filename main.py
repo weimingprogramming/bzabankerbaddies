@@ -4,11 +4,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from problems import p1, p2, p3, p4, p5, p6
 
-# 1. Extract the ASGI app from the FastMCP instance
 mcp_app = p4.mcp.http_app(path="/")
 
-# 2. CRITICAL BUGFIX: The organizers' code sets the lifespan on the WRONG app instance.
-# We must pass `mcp_app` into its own lifespan so it initializes its background tasks on its own state!
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp_app.lifespan(mcp_app):
@@ -16,21 +13,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Competition Service Engine", lifespan=lifespan)
 
-# 3. Mount the MCP app
 app.mount("/mcp", mcp_app)
 
-# Mount root endpoints
+# ==========================================
+# 1. Mount root endpoints (REQUIRED BY GRADER)
+# ==========================================
 app.include_router(p1.router, prefix="", tags=["Problem 1 - Root"])
 app.include_router(p2.router, prefix="", tags=["Problem 2 - Gateway"])
 app.include_router(p3.router, prefix="", tags=["Problem 3 - Showdown"])
+app.include_router(p5.router, prefix="", tags=["Problem 5 - Ghost Chains"])
 
-# Standard prefixes
+# ADD P6 HERE FOR THE GRADER -> Exposes /stonks
+app.include_router(p6.router, prefix="", tags=["Problem 6 - Root"]) 
+
+
+# ==========================================
+# 2. Standard prefixes (FOR CONSISTENCY)
+# ==========================================
 app.include_router(p1.router, prefix="/p1", tags=["Problem 1"])
 app.include_router(p2.router, prefix="/p2", tags=["Problem 2"])
 app.include_router(p3.router, prefix="/p3", tags=["Problem 3"])
+app.include_router(p5.router, prefix="/p5", tags=["Problem 5"])
 
-app.include_router(p5.router, prefix="", tags=["Problem 5 - Ghost Chains"])
-app.include_router(p6.router, prefix="", tags=["Problem 6 - Time Travelling Stonks"])
+# ADD P6 HERE FOR CONSISTENCY -> Exposes /p6/stonks
+app.include_router(p6.router, prefix="/p6", tags=["Problem 6 - Time Travelling Stonks"])
+
 
 @app.get("/health")
 def health_check():
