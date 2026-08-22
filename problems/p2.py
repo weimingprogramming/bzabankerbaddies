@@ -2,142 +2,185 @@ import base64
 import json
 import math
 from typing import Any, Dict, List
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 
-# Priority string to integer mapping
 PRIORITY_MAP = {
-    "LOW": 1,
-    "NORMAL": 2,
-    "MED": 2,
-    "MEDIUM": 2,
-    "HIGH": 3,
-    "CRITICAL": 4,
-    "URGENT": 4,
+    "LOW": 1, "NORMAL": 2, "MED": 2, "MEDIUM": 2,
+    "HIGH": 3, "CRITICAL": 4, "URGENT": 4,
 }
 
-class SolveRequest(BaseModel):
-    payload: str
+
+def _decode_b64(raw: str) -> str:
+    """Decode a base64 string (standard or URL-safe) to UTF-8."""
+    b64 = raw.replace('\n', '').replace('\r', '').replace(' ', '')
+    b64 = b64.replace('-', '+').replace('_', '/')
+    rem = len(b64) % 4
+    if rem > 0:
+        b64 += "=" * (4 - rem)
+    return base64.b64decode(b64, validate=True).decode("utf-8")
 
 
-def _decode_payload(raw: str) -> dict:
-    """Decode payload from any format: plain JSON, base64, hex, or nested."""
-    raw = raw.strip()
-
-    # Try plain JSON first (starts with { or [)
-    if raw.startswith(("{", "[")):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-
-    # Try base64 (standard and URL-safe)
-    try:
-        b64_str = raw.replace('\n', '').replace('\r', '').replace(' ', '')
-        b64_str = b64_str.replace('-', '+').replace('_', '/')
-        missing_padding = len(b64_str) % 4
-        if missing_padding:
-            b64_str += "=" * (4 - missing_padding)
-        decoded = base64.b64decode(b64_str).decode("utf-8").strip()
-
-        # The decoded result might itself be JSON or another base64 layer
-        if decoded.startswith(("{", "[")):
-            return json.loads(decoded)
-        else:
-            # Recursively try decoding (handles double-base64)
-            return _decode_payload(decoded)
-    except Exception:
-        pass
-
-    # Try hex decoding
-    try:
-        decoded = bytes.fromhex(raw).decode("utf-8").strip()
-        return json.loads(decoded)
-    except Exception:
-        pass
-
-    raise ValueError(f"Could not decode payload")
+def _safe_dict(val: Any) -> dict:
+    """Return val if it's a dict, else empty dict."""
+    return val if isinstance(val, dict) else {}
 
 
-@router.post("/solve")
-def solve_problem_2(request: SolveRequest) -> Dict[str, Any]:
-    try:
-        raw_payload = request.payload.strip()
-        data = _decode_payload(raw_payload)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid payload format: {str(e)}"
-        )
+def _extract_adapt(data: dict) -> dict:
+    """
+    Extract adaptOutput fields from data, handling:
+    - V1: {adaptInput: {user: {id, fullName}, action, metadata: {priority}}}
+    - V2 flat: {adaptInput: {id, name, action, priority}}
+    - Root flat: {user: {id, fullName}, action, metadata: {priority}}
+    - Fully flat: {id, name, action, priority}
+    """
+    adapt_input = _safe_dict(data.get("adaptInput"))
 
-    adapt_input = data.get("adaptInput") or {}
-    user_obj = adapt_input.get("user") or {}
-    metadata_obj = adapt_input.get("metadata") or {}
+    # V1 nested user object — check adaptInput.user first, then root user
+    user_obj = _safe_dict(adapt_input.get("user")) or _safe_dict(data.get("user"))
 
-    # 2. Bridge V1 and V2 Models
-    # Look in the V1 nested objects first, fallback to the V2 root level
-    
-    user_id = user_obj.get("id") or adapt_input.get("id", "")
-    user_name = user_obj.get("fullName") or user_obj.get("name") or adapt_input.get("name", "")
-    action = str(adapt_input.get("action", "")).strip().lower()
+    # V1 nested metadata — check adaptInput.metadata first, then root metadata
+    metadata_obj = _safe_dict(adapt_input.get("metadata")) or _safe_dict(data.get("metadata"))
 
-    # Priority could be in metadata (V1) or at the root (V2)
-    raw_priority = metadata_obj.get("priority")
-    if raw_priority is None:
-        raw_priority = adapt_input.get("priority", 1)
+    # ID: user.id -> adaptInput.id -> root id
+    user_id = user_obj.get("id") or adapt_input.get("id") or data.get("id") or ""
 
-    # Standardize Priority to int
-    if isinstance(raw_priority, str):
-        priority = PRIORITY_MAP.get(raw_priority.strip().upper(), 1)
-    elif isinstance(raw_priority, (int, float)):
-        priority = int(raw_priority)
+    # Name: user.fullName -> user.name -> adaptInput.fullName -> adaptInput.name -> root
+    user_name = (
+        user_obj.get("fullName") or user_obj.get("name") or
+        adapt_input.get("fullName") or adapt_input.get("name") or
+        data.get("fullName") or data.get("name") or ""
+    )
+
+    # Action: adaptInput.action -> root action
+    action_raw = adapt_input.get("action") or data.get("action") or ""
+    action = str(action_raw).strip().lower()
+
+    # Priority: metadata.priority -> adaptInput.priority -> root priority
+    priority_raw = metadata_obj.get("priority")
+    if priority_raw is None:
+        priority_raw = adapt_input.get("priority")
+    if priority_raw is None:
+        priority_raw = data.get("priority")
+
+    if isinstance(priority_raw, str):
+        priority = PRIORITY_MAP.get(priority_raw.strip().upper(), 1)
+    elif isinstance(priority_raw, (int, float)) and not math.isnan(priority_raw) and not math.isinf(priority_raw):
+        priority = int(priority_raw)
     else:
         priority = 1
 
-    result: Dict[str, Any] = {
-        "adaptOutput": {
-            "id": user_id,
-            "name": user_name,
-            "action": action,
-            "priority": priority,
-        }
+    return {
+        "id": str(user_id) if user_id else "",
+        "name": str(user_name) if user_name else "",
+        "action": action,
+        "priority": priority,
     }
 
-    # 3. SLO Computation
-    heartbeats: List[Dict] = data.get("heartbeats") or []
+
+def _compute_slo(heartbeats: List[dict], slo_query: dict) -> dict:
+    """Compute SLO metrics from heartbeats filtered by sloQuery."""
+    target_service = slo_query.get("service", "")
+    since_raw = slo_query.get("since")
+
+    try:
+        since = int(since_raw) if since_raw is not None else None
+    except (ValueError, TypeError):
+        since = None
+
+    filtered = []
+    for hb in heartbeats:
+        if not isinstance(hb, dict):
+            continue
+        if target_service and hb.get("service") != target_service:
+            continue
+        if since is not None:
+            try:
+                hb_ts = int(hb.get("timestamp", 0))
+            except (ValueError, TypeError):
+                continue
+            if hb_ts < since:
+                continue
+        filtered.append(hb)
+
+    if not filtered:
+        return {"availability": 0.0, "p95LatencyMs": 0}
+
+    ok_count = sum(
+        1 for hb in filtered
+        if str(hb.get("status", "")).strip().upper() == "OK"
+    )
+    availability = ok_count / len(filtered)
+
+    latencies = []
+    for hb in filtered:
+        try:
+            lat = int(hb.get("latencyMs", 0))
+            if lat >= 0:
+                latencies.append(lat)
+        except (ValueError, TypeError):
+            continue
+
+    if not latencies:
+        return {"availability": availability, "p95LatencyMs": 0}
+
+    latencies.sort()
+    n = len(latencies)
+    idx = math.ceil(n * 0.95) - 1
+    p95 = latencies[max(0, idx)]
+
+    return {"availability": availability, "p95LatencyMs": p95}
+
+
+@router.post("/solve")
+async def solve_problem_2(request: Request) -> Dict[str, Any]:
+    # Accept any body shape — raw JSON or {payload: "..."}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
+    # Decode payload if present
+    data = body
+    if "payload" in body:
+        payload_val = body["payload"]
+        if isinstance(payload_val, dict):
+            data = payload_val
+        elif isinstance(payload_val, str):
+            raw = payload_val.strip()
+            try:
+                if raw.startswith(("{", "[")):
+                    data = json.loads(raw)
+                else:
+                    decoded = _decode_b64(raw)
+                    # Handle potential nested base64
+                    decoded = decoded.strip()
+                    if decoded.startswith(("{", "[")):
+                        data = json.loads(decoded)
+                    else:
+                        data = json.loads(_decode_b64(decoded))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not decode payload")
+
+    # Build adaptOutput
+    adapt_output = _extract_adapt(data)
+
+    # Build sloOutput — always include it per the spec's "combined response"
+    heartbeats = data.get("heartbeats")
+    if not isinstance(heartbeats, list):
+        heartbeats = []
+
     slo_query = data.get("sloQuery")
+    if not isinstance(slo_query, dict):
+        slo_query = {}
 
-    if slo_query is not None:
-        target_service = slo_query.get("service", "")
-        since = slo_query.get("since", 0)
+    slo_output = _compute_slo(heartbeats, slo_query)
 
-        filtered = [
-            hb for hb in heartbeats
-            if hb.get("service") == target_service and hb.get("timestamp", 0) >= since
-        ]
-
-        if not filtered:
-            result["sloOutput"] = {
-                "availability": 0.0,
-                "p95LatencyMs": 0,
-            }
-        else:
-            ok_count = sum(
-                1 for hb in filtered
-                if str(hb.get("status", "")).strip().upper() == "OK"
-            )
-            # Removed arbitrary rounding here to avoid failing exact-float assertions
-            availability = ok_count / len(filtered)
-
-            latencies = sorted(hb.get("latencyMs", 0) for hb in filtered)
-            n = len(latencies)
-            idx = math.ceil(n * 0.95) - 1
-            p95 = latencies[max(idx, 0)]
-
-            result["sloOutput"] = {
-                "availability": availability,
-                "p95LatencyMs": p95,
-            }
-
-    return result
+    return {
+        "adaptOutput": adapt_output,
+        "sloOutput": slo_output,
+    }

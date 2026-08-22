@@ -332,3 +332,291 @@ def navigate(
         return "ERROR: No valid path found."
     except Exception as e:
         return f"ERROR: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Stage 3 Tools: Working Life (Venues, Schedules, Meetings, Outings)
+# ---------------------------------------------------------------------------
+
+_inbox_cache: list = []
+
+
+def _fetch_json(url: str):
+    """Fetch a URL and return parsed JSON, or None on failure."""
+    raw = _fetch_url(url)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _fetch_inbox() -> list:
+    """Fetch and cache the android's inbox."""
+    global _inbox_cache
+    if _inbox_cache:
+        return _inbox_cache
+    data = _fetch_json(f"{BASE_URL}/inbox")
+    if isinstance(data, list):
+        _inbox_cache = data
+    return _inbox_cache
+
+
+def _parse_inbox_for_day(day: str) -> dict:
+    """Parse inbox emails, return {'busy': [...], 'tentative': [...]} intervals for a given day."""
+    inbox = _fetch_inbox()
+    busy = []
+    tentative = []
+    for email in inbox:
+        body = email.get("body", "")
+        response = None
+        when_day = None
+        when_time = None
+        for line in body.split("\n"):
+            line = line.strip()
+            if line.lower().startswith("response:"):
+                response = line.split(":", 1)[1].strip().upper()
+            if line.lower().startswith("when:"):
+                when_part = line.split(":", 1)[1].strip()
+                parts = when_part.split()
+                if len(parts) >= 2:
+                    when_day = parts[0]
+                    when_time = parts[1] if len(parts) >= 2 else None
+                    # Handle "When: Monday 09:00-10:00" format
+                    # Also handle "When: Monday 09:00 - 10:00" with spaces
+                    time_str = " ".join(parts[1:])
+                    when_time = time_str.replace(" ", "")
+        if response and when_day and when_time and when_day.lower() == day.lower():
+            if response == "ACCEPTED":
+                busy.append(when_time)
+            elif response == "TENTATIVE":
+                tentative.append(when_time)
+    return {"busy": busy, "tentative": tentative}
+
+
+def _time_to_min(t: str) -> int:
+    """Convert HH:MM to minutes from midnight."""
+    h, m = t.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _min_to_time(m: int) -> str:
+    """Convert minutes from midnight to HH:MM."""
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _parse_interval(interval_str: str):
+    """Parse 'HH:MM-HH:MM' into (start_min, end_min)."""
+    parts = interval_str.split("-")
+    if len(parts) == 2:
+        return _time_to_min(parts[0]), _time_to_min(parts[1])
+    return None
+
+
+def _merge_intervals(intervals):
+    """Merge overlapping (start, end) intervals."""
+    if not intervals:
+        return []
+    intervals.sort()
+    merged = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _find_free_windows(busy_intervals, duration_minutes, day_start=0, day_end=1440):
+    """Find all free windows of at least duration_minutes between busy intervals."""
+    merged = _merge_intervals(busy_intervals)
+    windows = []
+    prev_end = day_start
+    for s, e in merged:
+        if s - prev_end >= duration_minutes:
+            windows.append((prev_end, s))
+        prev_end = max(prev_end, e)
+    if day_end - prev_end >= duration_minutes:
+        windows.append((prev_end, day_end))
+    return windows
+
+
+@mcp.tool()
+def find_open_venues(day: str, time: str) -> str:
+    """
+    Find all venues that are open on a given day at a specific time.
+    Use this when asked which venues/places are open or available.
+
+    Args:
+        day: The day of the week (e.g., 'Monday').
+        time: The time to check in HH:MM format (e.g., '12:00').
+    """
+    data = _fetch_json(f"{BASE_URL}/venues/{day}")
+    if not data:
+        return "Could not fetch venues."
+    check = _time_to_min(time)
+    open_venues = []
+    for v in data:
+        o = _time_to_min(v["open"])
+        c = _time_to_min(v["close"])
+        if o <= check < c:
+            open_venues.append(v["name"])
+    if not open_venues:
+        return "No venues are open at that time."
+    return ", ".join(open_venues)
+
+
+@mcp.tool()
+def find_meeting_time(day: str, friends: str, duration_minutes: int) -> str:
+    """
+    Find the earliest available meeting time for the android and a group of friends on a given day.
+    Checks everyone's schedule and the android's inbox commitments to find a free window.
+    Use this when asked to find a time to meet, schedule a meeting, or find when everyone is free.
+
+    Args:
+        day: The day of the week (e.g., 'Monday').
+        friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
+        duration_minutes: Required meeting duration in minutes (e.g., 60).
+    """
+    friend_list = [f.strip() for f in friends.split(",") if f.strip()]
+
+    # Fetch all friend schedules in parallel
+    urls = [f"{BASE_URL}/schedule/{friend}/{day}" for friend in friend_list]
+    all_busy = []
+
+    with ThreadPoolExecutor(max_workers=max(len(urls), 1)) as pool:
+        futures = {pool.submit(_fetch_url, u): friend for u, friend in zip(urls, friend_list)}
+        for fut in futures:
+            raw = fut.result()
+            if raw:
+                try:
+                    blocks = json.loads(raw)
+                    for block in blocks:
+                        interval = _parse_interval(f"{block['start']}-{block['end']}")
+                        if interval:
+                            all_busy.append(interval)
+                except Exception:
+                    pass
+
+    # Parse android's inbox for the day
+    inbox_data = _parse_inbox_for_day(day)
+    tentative_intervals = []
+
+    for t_str in inbox_data["busy"]:
+        interval = _parse_interval(t_str)
+        if interval:
+            all_busy.append(interval)
+
+    for t_str in inbox_data["tentative"]:
+        interval = _parse_interval(t_str)
+        if interval:
+            tentative_intervals.append(interval)
+
+    # Find free windows excluding hard-busy
+    free_windows = _find_free_windows(all_busy, duration_minutes)
+
+    if not free_windows:
+        return "No available meeting time found."
+
+    # Prefer windows with no tentative conflicts
+    merged_tentative = _merge_intervals(tentative_intervals) if tentative_intervals else []
+
+    def _overlaps_tentative(window_start, window_end):
+        for ts, te in merged_tentative:
+            if ts < window_end and te > window_start:
+                return True
+        return False
+
+    # Try to find earliest window that doesn't conflict with tentative
+    for ws, we in free_windows:
+        slot_end = ws + duration_minutes
+        if slot_end <= we and not _overlaps_tentative(ws, slot_end):
+            return f"{_min_to_time(ws)}-{_min_to_time(slot_end)}"
+
+    # Fall back to earliest window (even if tentative conflict)
+    ws, we = free_windows[0]
+    slot_end = ws + duration_minutes
+    return f"{_min_to_time(ws)}-{_min_to_time(slot_end)}"
+
+
+@mcp.tool()
+def find_meeting_point(day: str, friends: str, my_x: int, my_y: int) -> str:
+    """
+    Find the optimal meeting point on a 10x10 grid that minimizes total Manhattan distance
+    for the android and a group of friends.
+    Use this when asked where to meet, find a meeting point, or find a central location.
+
+    Args:
+        day: The day of the week (e.g., 'Monday').
+        friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
+        my_x: The android's x-coordinate (0-9).
+        my_y: The android's y-coordinate (0-9).
+    """
+    friend_list = [f.strip() for f in friends.split(",") if f.strip()]
+    points = [(my_x, my_y)]
+
+    # Fetch friend locations in parallel
+    urls = [f"{BASE_URL}/location/{friend}/{day}" for friend in friend_list]
+    with ThreadPoolExecutor(max_workers=max(len(urls), 1)) as pool:
+        futures = [pool.submit(_fetch_url, u) for u in urls]
+        for fut in futures:
+            raw = fut.result()
+            if raw:
+                try:
+                    loc = json.loads(raw)
+                    points.append((loc["x"], loc["y"]))
+                except Exception:
+                    pass
+
+    # Optimal meeting point: median of x's, median of y's
+    xs = sorted(p[0] for p in points)
+    ys = sorted(p[1] for p in points)
+
+    def _total_dist(cx, cy):
+        return sum(abs(cx - px) + abs(cy - py) for px, py in points)
+
+    n = len(xs)
+    if n % 2 == 1:
+        best_x = xs[n // 2]
+        best_y = ys[n // 2]
+    else:
+        # Try both median candidates and pick the better one
+        x_candidates = [xs[n // 2 - 1], xs[n // 2]]
+        y_candidates = [ys[n // 2 - 1], ys[n // 2]]
+        best = None
+        best_x, best_y = x_candidates[0], y_candidates[0]
+        for cx in x_candidates:
+            for cy in y_candidates:
+                d = _total_dist(cx, cy)
+                if best is None or d < best:
+                    best = d
+                    best_x, best_y = cx, cy
+
+    # Clamp to grid
+    best_x = max(0, min(9, best_x))
+    best_y = max(0, min(9, best_y))
+
+    return f"[{best_x},{best_y}]"
+
+
+@mcp.tool()
+def plan_outing(day: str, friends: str, my_x: int, my_y: int, duration_minutes: int) -> str:
+    """
+    Plan a complete outing: find meeting time, meeting point, and a suitable open venue.
+    Use this when asked to plan an outing, get-together, or hangout with friends.
+
+    Args:
+        day: The day of the week (e.g., 'Monday').
+        friends: Comma-separated list of friend names (e.g., 'Alice,Bob').
+        my_x: The android's x-coordinate (0-9).
+        my_y: The android's y-coordinate (0-9).
+        duration_minutes: Required meeting duration in minutes (e.g., 60).
+    """
+    time_window = find_meeting_time(day, friends, duration_minutes)
+    meeting_point = find_meeting_point(day, friends, my_x, my_y)
+
+    # Find venues open at the start of the meeting window
+    meet_start = time_window.split("-")[0] if "-" in time_window else "12:00"
+    venues_str = find_open_venues(day, meet_start)
+
+    return f"{time_window}, {meeting_point}, {venues_str}"
