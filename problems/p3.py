@@ -1,39 +1,35 @@
-import logging
 from fastapi import APIRouter
 from typing import Dict, Any
 
-# Set up a logger that blasts straight through to Render's console
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
-
 router = APIRouter()
+
+# Global memory to store the scout's recon data
+scout_logs = []
 
 @router.post("/move")
 def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
-    # 1. Extract the intel
+    global scout_logs
+    
+    rule = state.get("table_rule", "unknown")
+    leg = state.get("leg_number", "?")
+    
     recent = state.get("recent_hands", [])
     if recent:
         last_hand = recent[-1]
         
-        # Only log if we saw their cards
-        if last_hand.get("showdown"):
-            rule = state.get("table_rule", "unknown")
-            leg = state.get("leg_number", "?")
-            
-            my_cards = last_hand["showdown"].get("your_cards", [])
-            opp_cards = last_hand["showdown"].get("opponent_cards", [])
-            chip_delta = last_hand.get("chip_delta", 0)
-            
-            winner = "TIE"
-            if chip_delta > 0: winner = "WE WON"
-            elif chip_delta < 0: winner = "OPPONENT WON"
-            
-            # WARNING level guarantees it prints immediately
-            logger.warning(
-                f"LEG {leg} | RULE: {rule} | Me: {my_cards} | Opp: {opp_cards} | {winner}"
-            )
+        # Save the raw dictionary so we can inspect exactly what the judge sends
+        log_entry = {
+            "leg": leg,
+            "rule": rule,
+            "hand_data": last_hand
+        }
+        scout_logs.append(log_entry)
+        
+        # Keep the last 100 hands so the server doesn't run out of memory
+        if len(scout_logs) > 100:
+            scout_logs.pop(0)
 
-    # 2. Force the showdown
+    # Force the showdown
     valid_actions = state.get("valid_actions", [])
     
     if "check" in valid_actions:
@@ -42,3 +38,8 @@ def play_showdown(state: Dict[str, Any]) -> Dict[str, Any]:
         return {"action": "call"}
     else:
         return {"action": valid_actions[0] if valid_actions else "fold"}
+
+# --- NEW: The Intel Extraction Endpoint ---
+@router.get("/intel")
+def get_intel():
+    return {"recon_data": scout_logs}
