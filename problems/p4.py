@@ -145,17 +145,8 @@ def _fetch_graph(map_id: str) -> dict:
 # Stage 2 Tools: Recall and Navigate
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def retrieve(query: str) -> List[str]:
-    """
-    Recalls relevant passages from the study materials to answer a question.
-    Use this tool whenever you need to answer a factual question, recall information,
-    or look up any fact such as a date, name, place, event, or detail.
-    Just pass the question and the tool returns the most relevant passages.
-
-    Args:
-        query: The exact question you need to answer.
-    """
+def _retrieve_impl(text: str) -> List[str]:
+    """Shared implementation for study material retrieval."""
     import math
 
     chunks = _load_study_materials()
@@ -180,7 +171,7 @@ def retrieve(query: str) -> List[str]:
     idf = {w: math.log((N + 1) / (freq + 1)) + 1.0 for w, freq in df.items()}
 
     # Extract query keywords
-    raw_q_words = re.findall(r'\b\w+\b', query.lower())
+    raw_q_words = re.findall(r'\b\w+\b', text.lower())
     q_words = {w for w in raw_q_words if w not in STOPWORDS}
 
     # Score each chunk by sum of IDF weights for matching query words
@@ -231,18 +222,46 @@ def retrieve(query: str) -> List[str]:
 
 
 @mcp.tool()
+def retrieve(query: str) -> List[str]:
+    """
+    Recalls relevant passages from the study materials to answer a question.
+    Use this tool whenever you need to answer a factual question, recall information,
+    or look up any fact such as a date, name, place, event, or detail.
+    Just pass the question and the tool returns the most relevant passages.
+
+    Args:
+        query: The exact question you need to answer.
+    """
+    return _retrieve_impl(query)
+
+
+@mcp.tool()
+def get_relevant_study_pass(question: str) -> List[str]:
+    """
+    Recalls relevant passages from the study materials to answer a question.
+    Use this tool whenever you need to answer a factual question, recall information,
+    or look up any fact such as a date, name, place, event, or detail.
+    Just pass the question and the tool returns the most relevant passages.
+
+    Args:
+        question: The exact question you need to answer.
+    """
+    return _retrieve_impl(question)
+
+
+@mcp.tool()
 def navigate(
     current_node: str,
     destination: str,
     map_id: str,
     visited_nodes: List[str] = None,
-    hops_left: int = 999
+    hops_remaining: int = 999
 ) -> str:
     """
     Returns the next node to move to on a journey from current_node to destination.
     CRITICAL: Use this tool IMMEDIATELY when asked a question like "How can I get from X to Y? map_id: Z".
     Call this tool once per step of your journey until you reach the destination.
-    If the question says "in N moves" or "within N steps", pass hops_left=N on first call,
+    If the question says "in N moves" or "within N steps", pass hops_remaining=N on first call,
     then decrement by 1 on each subsequent call.
 
     Args:
@@ -250,17 +269,18 @@ def navigate(
         destination: The node you need to reach (e.g., 'D').
         map_id: The map identifier string provided in the question.
         visited_nodes: Nodes already visited on this journey (to avoid revisiting).
-        hops_left: Maximum number of moves remaining. If the question specifies a move limit, use it. Decrement by 1 each call.
+        hops_remaining: Maximum number of moves remaining. If the question specifies a move limit, use it. Decrement by 1 each call.
     """
     if visited_nodes is None:
         visited_nodes = []
     elif isinstance(visited_nodes, str):
         visited_nodes = [x.strip() for x in visited_nodes.replace("[", "").replace("]", "").replace("'", "").replace('"', "").split(",") if x.strip()]
-        
+
+    hops_left = 999
     try:
-        hops_left = int(hops_left)
+        hops_left = int(hops_remaining)
     except Exception:
-        hops_left = 999
+        pass
 
     data = _fetch_graph(map_id)
     if "error" in data:
